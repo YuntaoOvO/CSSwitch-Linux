@@ -38,6 +38,30 @@ test("leaf encryption.key symlink is refused, target untouched", () => {
   assert.equal(fs.readFileSync(secret, "utf-8"), "ORIGINAL");
 });
 
+test("encryption.key symlinked to a DIRECTORY is rejected before dereference, not EISDIR", () => {
+  // 区分「读之前拒绝」与「读之后才崩」：叶子符号链接指向目录时，
+  // existsSync 会跟随符号链接判为存在，readFileSync 跟随符号链接读目录会抛 EISDIR
+  // （未捕获，进程带着 Node 原生错误堆栈退出），stderr 里不会出现「符号链接」字样。
+  // 若在 existsSync/readFileSync 之前先 assertNotSymlink(keyFile)，则会在解引用之前
+  // 就以「是符号链接，绝不跟随写入」拒绝并 exit 3，stderr 命中 /符号链接/。
+  const t = mktmp();
+  const auth = path.join(t, ".sandbox", "auth");
+  fs.mkdirSync(auth, { recursive: true });
+  const dirTarget = path.join(t, "dir-target");
+  fs.mkdirSync(dirTarget, { recursive: true });
+  fs.symlinkSync(dirTarget, path.join(auth, "encryption.key"));
+  let threw = false;
+  let stderr = "";
+  try {
+    run(auth);
+  } catch (e) {
+    threw = true;
+    stderr = (e.stderr || Buffer.alloc(0)).toString("utf-8");
+  }
+  assert.ok(threw, "expected run() to throw for a directory-symlinked encryption.key");
+  assert.match(stderr, /符号链接/);
+});
+
 test("normal sandbox dir writes regular 0600 files", () => {
   const t = mktmp();
   const auth = path.join(t, ".sandbox", "auth");

@@ -111,6 +111,10 @@ const b64_32 = () => crypto.randomBytes(32).toString("base64");
 
 fs.mkdirSync(resolvedAuth, { recursive: true, mode: 0o700 });
 let keys;
+// 复用分支的 existsSync/readFileSync 都会跟随符号链接：若 encryption.key 是预置的
+// 符号链接（哪怕指向目录），二者都会解引用到目标。必须先拒绝符号链接，再判断是否存在，
+// 避免在真正读到内容（或触发 EISDIR 之类的非预期崩溃）之前没有先做安全检查。
+assertNotSymlink(keyFile);
 if (fs.existsSync(keyFile) && !force) {
   keys = parseKeyFile(fs.readFileSync(keyFile, "utf-8"));
   for (const k of KEY_NAMES) if (!keys[k]) keys[k] = k === "JWT_SIGNING_SECRET" ? b64_32() : b64_32();
