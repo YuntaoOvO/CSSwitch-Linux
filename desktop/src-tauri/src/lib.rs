@@ -734,6 +734,139 @@ fn fetch_relay_models(
     }
 }
 
+/// 选了模型 → 验具体模型（POST /v1/messages）；留空（仅透传预设）→ 验端点+鉴权（GET /v1/models）。
+fn probe_kind_for_model(model: &str) -> scratch::ProbeKind {
+    if model.trim().is_empty() {
+        scratch::ProbeKind::Models
+    } else {
+        scratch::ProbeKind::Message
+    }
+}
+
+/// 预设表交前端铺 UI（单一来源，前端不复制常量）。
+#[tauri::command]
+fn get_relay_presets() -> serde_json::Value {
+    let list: Vec<serde_json::Value> = relay_presets::all()
+        .iter()
+        .map(|p| {
+            json!({
+                "id": p.id,
+                "name": p.name,
+                "base_url": p.base_url,
+                "base_url_editable": p.base_url_editable,
+                "requires_model_override": p.requires_model_override,
+                "builtin_models": p.builtin_models,
+            })
+        })
+        .collect();
+    json!({ "presets": list })
+}
+
+#[derive(Deserialize)]
+struct SaveRelayReq {
+    preset: String,
+    /// 新填 key；空=沿用已存。
+    key: String,
+    base_url: String,
+    /// 选中的上游模型；空=透传（仅 requires_model_override=false 的预设允许）。
+    model: String,
+    /// 含糊态（网络/429/5xx）时用户显式跳过验证直接存。
+    skip_verify: bool,
+}
+
+/// 事务化存中转站配置（修评审 P1-1）：候选 → scratch 代理验证 →**仅 200 才原子提交 + 切正式代理**。
+/// 401/403/模型错 → 不提交、不动旧链路；网络/429/5xx → 不提交 + 提示可「跳过验证保存」。
+/// 与 native-entry validate_and_save 共用 scratch 内核（spec §11）。
+#[tauri::command]
+fn save_relay_config(
+    app: tauri::AppHandle,
+    state: State<'_, Mutex<AppState>>,
+    req: SaveRelayReq,
+) -> Result<serde_json::Value, String> {
+    let preset_id = req.preset.trim().to_string();
+    let preset =
+        relay_presets::by_id(&preset_id).ok_or_else(|| format!("未知中转站预设：{preset_id}"))?;
+    let base_url = if preset.base_url_editable {
+        req.base_url.trim().to_string()
+    } else {
+        preset.base_url.to_string()
+    };
+    if base_url.is_empty() || !(base_url.starts_with("http://") || base_url.starts_with("https://"))
+    {
+        return Err("请先填写中转站 base_url（http:// 或 https:// 开头）。".into());
+    }
+    let model = req.model.trim().to_string();
+    // 门控：requires_model_override 的预设禁止留空透传（杜绝存下必坏配置，修评审 P1-3）。
+    if preset.requires_model_override && model.is_empty() {
+        return Err(format!(
+            "{} 需要选一个模型才能保存（该中转站不认 claude-* / 无 /v1/models）。",
+            preset.name
+        ));
+    }
+    let key = resolve_probe_key(&preset_id, &req.key)?;
+
+    // 提交闭包：落盘 providers[preset] + provider=preset，随后切正式代理。
+    let commit = {
+        let dir = config::default_dir();
+        let (pid, bu, k, m) = (
+            preset_id.clone(),
+            base_url.clone(),
+            key.clone(),
+            model.clone(),
+        );
+        move || -> Result<(), String> {
+            config::update(&dir, |c| {
+                c.provider = pid.clone();
+                let e = c.providers.entry(pid.clone()).or_default();
+                e.key = k.clone();
+                e.base_url = bu.clone();
+                e.model = m.clone();
+            })
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        }
+    };
+
+    if req.skip_verify {
+        commit()?;
+        let (_p, _s, _a) = ensure_proxy(&app, &state)?; // 切正式代理（带新配置）
+        return Ok(json!({ "committed": true, "hint": "已跳过验证保存并切换代理。" }));
+    }
+
+    // scratch 验证（不碰正式链路）。
+    let root = asset_root(&app).ok_or("找不到代理脚本 proxy/csswitch_proxy.py。")?;
+    let py = proc::find_exe("python3").ok_or("缺少依赖 python3（起临时代理需要）。")?;
+    let script = root.join("proxy/csswitch_proxy.py");
+    let res = scratch::scratch_probe(
+        &py,
+        &script,
+        &base_url,
+        &key,
+        Some(&model),
+        probe_kind_for_model(&model),
+    );
+    match scratch::classify(res.status) {
+        scratch::ProbeOutcome::Ok => {
+            commit()?;
+            ensure_proxy(&app, &state)?;
+            Ok(json!({ "committed": true, "hint": "验证通过，已保存并切换代理。" }))
+        }
+        scratch::ProbeOutcome::Auth(code) => Ok(json!({
+            "committed": false,
+            "hint": format!("上游拒绝（{code}），key/权限有误，未保存（旧配置不变）。")
+        })),
+        scratch::ProbeOutcome::ModelError(code) => Ok(json!({
+            "committed": false,
+            "hint": format!("上游拒绝该模型（{code}），未保存。请换一个模型或核对 base_url。")
+        })),
+        scratch::ProbeOutcome::Ambiguous(_) | scratch::ProbeOutcome::NoResponse => Ok(json!({
+            "committed": false,
+            "hint": "无法确认（网络/上游繁忙），未保存。可重试，或用「跳过验证保存」。",
+            "can_skip": true
+        })),
+    }
+}
+
 #[tauri::command]
 fn stop_all(app: tauri::AppHandle, state: State<'_, Mutex<AppState>>) -> Result<(), String> {
     let mut st = lock(&state);
@@ -1095,6 +1228,8 @@ pub fn run() {
             start_proxy,
             verify_key,
             fetch_relay_models,
+            save_relay_config,
+            get_relay_presets,
             stop_all,
             one_click_login,
             status,
@@ -1262,5 +1397,17 @@ mod tests {
         assert_eq!(ids.iter().filter(|i| *i == "m-tools").count(), 1, "去重");
         // 末位是明确不支持工具的。
         assert_eq!(ids.last().unwrap(), "m-notools");
+    }
+
+    #[test]
+    fn probe_kind_picks_message_when_model_set() {
+        assert!(matches!(
+            super::probe_kind_for_model("mimo-v2.5-pro"),
+            crate::scratch::ProbeKind::Message
+        ));
+        assert!(matches!(
+            super::probe_kind_for_model(""),
+            crate::scratch::ProbeKind::Models
+        ));
     }
 }
