@@ -298,5 +298,172 @@ class RewriterPassthrough(unittest.TestCase):
         self.assertEqual(sorted(stops), sorted(starts))  # 每个 start 恰一个 stop
 
 
+def dsml_text_stream(query, pipe="｜｜", pre="", post=""):
+    """一段把 web_search 泄漏成 DSML 文本的流。"""
+    leak = (pre + f'<{pipe}DSML{pipe}tool_calls> <{pipe}DSML{pipe}invoke name="web_search">'
+            f'<{pipe}DSML{pipe}parameter name="query" string="true">{query}'
+            f'</{pipe}DSML{pipe}parameter> </{pipe}DSML{pipe}invoke> </{pipe}DSML{pipe}tool_calls>' + post)
+    return "".join([
+        sse("message_start", {"type": "message_start", "message": {"id": "m", "type": "message",
+            "role": "assistant", "model": "deepseek-v4-pro", "content": [], "stop_reason": None,
+            "usage": {"input_tokens": 1, "output_tokens": 0}}}),
+        sse("content_block_start", {"type": "content_block_start", "index": 0,
+            "content_block": {"type": "text", "text": ""}}),
+        sse("content_block_delta", {"type": "content_block_delta", "index": 0,
+            "delta": {"type": "text_delta", "text": leak}}),
+        sse("content_block_stop", {"type": "content_block_stop", "index": 0}),
+        sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+            "usage": {"output_tokens": 9}}),
+        sse("message_stop", {"type": "message_stop"}),
+    ])
+
+
+class RewriterDsml(unittest.TestCase):
+    def _run(self, raw_str, chunk):
+        rw = ds.DsmlStreamRewriter(WS, nonce="t")
+        data = raw_str.encode("utf-8")
+        out = b""
+        for i in range(0, len(data), chunk):
+            out += rw.feed(data[i:i + chunk])
+        out += rw.finalize()
+        return parse_sse(out)
+
+    def _tool_uses(self, evs):
+        return [d["content_block"] for e, d in evs
+                if e == "content_block_start" and isinstance(d, dict)
+                and d.get("content_block", {}).get("type") == "tool_use"]
+
+    def _stop_reason(self, evs):
+        return [d for e, d in evs if e == "message_delta"][0]["delta"]["stop_reason"]
+
+    def test_leak_becomes_tool_use_various_chunks(self):
+        for chunk in (1, 3, 7, 4096):
+            evs = self._run(dsml_text_stream("GSE207177"), chunk)
+            tus = self._tool_uses(evs)
+            self.assertEqual(len(tus), 1, f"chunk={chunk}")
+            self.assertEqual(tus[0]["name"], "web_search")
+            self.assertEqual(self._stop_reason(evs), "tool_use", f"chunk={chunk}")
+
+    def test_tool_use_input_carried_via_input_json_delta(self):
+        evs = self._run(dsml_text_stream("hello"), 5)
+        ijd = [d for e, d in evs if e == "content_block_delta"
+               and d.get("delta", {}).get("type") == "input_json_delta"]
+        self.assertTrue(ijd)
+        merged = "".join(x["delta"]["partial_json"] for x in ijd)
+        self.assertEqual(json.loads(merged), {"query": "hello"})
+
+    def test_no_double_stop_and_indices_unique(self):
+        evs = self._run(dsml_text_stream("q"), 6)
+        stops = [d["index"] for e, d in evs if e == "content_block_stop"]
+        starts = [d["index"] for e, d in evs if e == "content_block_start"]
+        self.assertEqual(len(stops), len(set(stops)))     # 无重复关闭
+        self.assertEqual(len(starts), len(set(starts)))   # 索引唯一
+        self.assertEqual(sorted(stops), sorted(starts))   # 每个 start 恰一个 stop
+
+    def test_pre_and_post_text_preserved(self):
+        evs = self._run(dsml_text_stream("q", pre="before ", post=" after"), 3)
+        texts = "".join(d["delta"]["text"] for e, d in evs if e == "content_block_delta"
+                        and d.get("delta", {}).get("type") == "text_delta")
+        self.assertIn("before ", texts)
+        self.assertIn(" after", texts)
+        self.assertNotIn("DSML", texts)     # DSML 标记不残留在可见文本
+
+    def test_incomplete_dsml_flushed_as_text(self):
+        # 有 OPEN 无 CLOSE：EOF 时应把扣留文本原样吐出、不覆写 stop_reason
+        src = "".join([
+            sse("content_block_start", {"type": "content_block_start", "index": 0,
+                "content_block": {"type": "text", "text": ""}}),
+            sse("content_block_delta", {"type": "content_block_delta", "index": 0,
+                "delta": {"type": "text_delta",
+                          "text": '<｜｜DSML｜｜tool_calls> <｜｜DSML｜｜invoke name="web_search">'}}),
+            sse("content_block_stop", {"type": "content_block_stop", "index": 0}),
+            sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {}}),
+            sse("message_stop", {"type": "message_stop"}),
+        ])
+        evs = self._run(src, 5)
+        texts = "".join(d["delta"]["text"] for e, d in evs if e == "content_block_delta"
+                        and d.get("delta", {}).get("type") == "text_delta")
+        self.assertIn("DSML", texts)                      # 扣留内容被吐回、未吞
+        self.assertEqual(self._stop_reason(evs), "end_turn")
+
+    def test_unknown_tool_stream_stays_text(self):
+        evs = self._run(dsml_text_stream("q").replace("web_search", "evil_exec"), 5)
+        self.assertEqual(self._tool_uses(evs), [])        # 未声明工具不合成
+        self.assertEqual(self._stop_reason(evs), "end_turn")
+
+    def test_stream_matches_segment_invariant(self):
+        # 一致性不变式：状态机产出的 text/tool 顺序 == segment_dsml_text(全文)
+        query = "q"
+        leak_text = (f'A<｜｜DSML｜｜tool_calls> '
+                     f'<｜｜DSML｜｜invoke name="web_search">'
+                     f'<｜｜DSML｜｜parameter name="query" string="true">{query}'
+                     f'</｜｜DSML｜｜parameter> </｜｜DSML｜｜invoke> '
+                     f'</｜｜DSML｜｜tool_calls>B')
+        want = [s["type"] for s in ds.segment_dsml_text(leak_text, WS)]
+        src = "".join([
+            sse("content_block_start", {"type": "content_block_start", "index": 0,
+                "content_block": {"type": "text", "text": ""}}),
+            sse("content_block_delta", {"type": "content_block_delta", "index": 0,
+                "delta": {"type": "text_delta", "text": leak_text}}),
+            sse("content_block_stop", {"type": "content_block_stop", "index": 0}),
+            sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {}}),
+            sse("message_stop", {"type": "message_stop"}),
+        ])
+        evs = self._run(src, 3)
+        got = []
+        for e, d in evs:
+            if e == "content_block_start" and isinstance(d, dict):
+                ct = d.get("content_block", {}).get("type")
+                if ct == "tool_use":
+                    got.append("tool_use")
+                elif ct == "text":
+                    got.append("text")
+        # 空 text 块可能出现，过滤掉没有实际文本的 text 段用不变式的宽松版：类型子序列一致
+        self.assertEqual([g for g in got], want)
+
+    def test_normal_text_ending_with_half_marker_flushed(self):
+        # 第三轮 P0：正常回答以 "2 <" 结尾（"<" 是可能的标记前缀）→ 边界必须 flush、不丢字
+        src = "".join([
+            sse("content_block_start", {"type": "content_block_start", "index": 0,
+                "content_block": {"type": "text", "text": ""}}),
+            sse("content_block_delta", {"type": "content_block_delta", "index": 0,
+                "delta": {"type": "text_delta", "text": "the answer is 2 <"}}),
+            sse("content_block_stop", {"type": "content_block_stop", "index": 0}),
+            sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {}}),
+            sse("message_stop", {"type": "message_stop"}),
+        ])
+        evs = self._run(src, 3)
+        texts = "".join(d["delta"]["text"] for e, d in evs if e == "content_block_delta"
+                        and d.get("delta", {}).get("type") == "text_delta")
+        self.assertEqual(texts, "the answer is 2 <")     # 半个标记也不丢
+        self.assertEqual(self._stop_reason(evs), "end_turn")
+
+    def test_close_tag_at_delta_end_then_more_text(self):
+        # 第三轮 P0：闭标签正好结束一个 delta、下一 delta 续普通文字 → 不产生 index=None
+        blk = ('<｜｜DSML｜｜tool_calls> <｜｜DSML｜｜invoke name="web_search">'
+               '<｜｜DSML｜｜parameter name="query" string="true">q</｜｜DSML｜｜parameter>'
+               ' </｜｜DSML｜｜invoke> </｜｜DSML｜｜tool_calls>')
+        src = "".join([
+            sse("content_block_start", {"type": "content_block_start", "index": 0,
+                "content_block": {"type": "text", "text": ""}}),
+            sse("content_block_delta", {"type": "content_block_delta", "index": 0,
+                "delta": {"type": "text_delta", "text": blk}}),        # 以闭标签结束
+            sse("content_block_delta", {"type": "content_block_delta", "index": 0,
+                "delta": {"type": "text_delta", "text": "done searching"}}),  # 续文字
+            sse("content_block_stop", {"type": "content_block_stop", "index": 0}),
+            sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {}}),
+            sse("message_stop", {"type": "message_stop"}),
+        ])
+        evs = self._run(src, 4096)     # 每 delta 单独喂
+        self.assertTrue(self._tool_uses(evs))
+        for e, d in evs:                # 所有 content_block_* 的 index 非 None
+            if e.startswith("content_block") and isinstance(d, dict):
+                self.assertIsNotNone(d.get("index"))
+        texts = "".join(d["delta"]["text"] for e, d in evs if e == "content_block_delta"
+                        and d.get("delta", {}).get("type") == "text_delta")
+        self.assertIn("done searching", texts)
+        self.assertEqual(self._stop_reason(evs), "tool_use")
+
+
 if __name__ == "__main__":
     unittest.main()

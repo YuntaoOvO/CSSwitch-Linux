@@ -209,12 +209,6 @@ class DsmlStreamRewriter:
             out.append(self._handle_frame(frame))
         return b"".join(out)
 
-    def _finalize_text(self):
-        return b""   # Task 5 覆盖
-
-    def _flush_pending(self):
-        return b""   # Task 5 覆盖：message 边界前 flush 扣留文本
-
     # ---- 单帧处理 ----
     def _handle_frame(self, frame):
         event, obj = self._parse_frame(frame)
@@ -241,17 +235,163 @@ class DsmlStreamRewriter:
         # message_start / ping / 其它：原样
         return self._raw(frame)
 
-    def _on_text_delta(self, text):
-        # Task 4：不检测，原样重发；Task 5 覆盖为扫描器。
-        return self._emit("content_block_delta", {"type": "content_block_delta",
-                          "index": self.cur_out, "delta": {"type": "text_delta", "text": text}})
+    # 最长可能的起始标记字符数（<｜｜DSML｜｜function_calls>），用于 PASS 回抜。
+    _MAX_OPEN = len("<｜｜DSML｜｜function_calls>")
+    _CAP = 256 * 1024
 
-    def _on_block_stop(self):
-        if self.cur_out is not None:
-            out = self._emit("content_block_stop", {"type": "content_block_stop", "index": self.cur_out})
+    def _on_text_delta(self, text):
+        out = []
+        if self.state == "PASS":
+            self.scan_buf += text
+            out.append(self._pass_scan())
+        else:
+            self.cap_buf += text
+            out.append(self._capture_scan())
+        return b"".join(out)
+
+    def _pass_scan(self):
+        out = []
+        while True:
+            m = _OPEN_RE.search(self.scan_buf)
+            if m:
+                before = self.scan_buf[:m.start()]
+                if before:
+                    out.append(self._text_delta(before))
+                # 关闭当前 text 块
+                if self.cur_out is not None:
+                    out.append(self._emit("content_block_stop",
+                              {"type": "content_block_stop", "index": self.cur_out}))
+                    self.cur_out = None
+                self.cap_buf = self.scan_buf[m.start():]   # 含 OPEN，供闭标签匹配
+                self.scan_buf = ""
+                self.state = "CAPTURE"
+                out.append(self._capture_scan())
+                return b"".join(out)
+            # 未命中：发出安全部分，保留末尾 _MAX_OPEN-1 作可能前缀
+            keep = self._MAX_OPEN - 1
+            if len(self.scan_buf) > keep:
+                emit = self.scan_buf[:-keep]
+                self.scan_buf = self.scan_buf[-keep:]
+                if emit:
+                    out.append(self._text_delta(emit))
+            return b"".join(out)
+
+    def _capture_scan(self):
+        out = []
+        cm = _TOOLCALLS_RE.search(self.cap_buf)
+        if cm:
+            calls = parse_dsml_tool_calls(cm.group(0), self.known_tools)
+            if calls:
+                for c in calls:
+                    out.append(self._tool_use_events(c))
+                self.synthesized = True
+            else:
+                # 未知工具 / 坏格式：把整段当字面文本
+                out.append(self._text_as_new_block(cm.group(0)))
+            rest = self.cap_buf[cm.end():]
+            self.cap_buf = ""
+            self.state = "PASS"
             self.cur_out = None
-            return out
-        return b""     # 已主动关闭 → 吞掉上游冗余 stop
+            if rest:
+                # 余料回 PASS 继续扫（可能又有 OPEN 或普通文本）
+                self.scan_buf = rest
+                out.append(self._pass_scan())
+            return b"".join(out)
+        # 无闭标签：超上限则保守回退
+        if len(self.cap_buf) > self._CAP:
+            out.append(self._text_as_new_block(self.cap_buf))
+            self.cap_buf = ""
+            self.state = "PASS"
+            self.cur_out = None
+        return b"".join(out)
+
+    def _finalize_text(self):
+        # 终审契约：兜底 flush 后必须【关闭】它新开/仍开的 text 块（发 content_block_stop），不能只 flush delta。
+        out = []
+        if self.state == "CAPTURE" and self.cap_buf:
+            out.append(self._text_as_new_block(self.cap_buf))   # 自带开+关
+            self.cap_buf = ""
+            self.state = "PASS"
+        if self.scan_buf:
+            out.append(self._text_delta(self.scan_buf))         # 懒开
+            self.scan_buf = ""
+        if self.cur_out is not None:                            # 关掉仍开的块
+            out.append(self._emit("content_block_stop",
+                      {"type": "content_block_stop", "index": self.cur_out}))
+            self.cur_out = None
+        return b"".join(out)
+
+    # ---- 边界 flush（第三轮 P0）：收 stop / message 前先吐扣留文本，杜绝丢字与 index=None ----
+    def _on_block_stop(self):
+        out = []
+        if self.state == "CAPTURE":
+            if self.cap_buf:
+                out.append(self._text_as_new_block(self.cap_buf))
+            self.cap_buf = ""
+            self.state = "PASS"
+        elif self.scan_buf and self.cur_out is not None:
+            # PASS 回抜尾巴：块要关了，直接吐进当前开块（不懒开）
+            out.append(self._emit("content_block_delta", {"type": "content_block_delta",
+                      "index": self.cur_out, "delta": {"type": "text_delta", "text": self.scan_buf}}))
+            self.scan_buf = ""
+        if self.cur_out is not None:
+            out.append(self._emit("content_block_stop",
+                      {"type": "content_block_stop", "index": self.cur_out}))
+            self.cur_out = None
+        return b"".join(out)
+
+    def _flush_pending(self):
+        # message_delta/message_stop 前：吐扣留文本并关块，保证无悬空文本、无跨 message 边界开块。
+        out = []
+        if self.state == "CAPTURE" and self.cap_buf:
+            out.append(self._text_as_new_block(self.cap_buf))
+            self.cap_buf = ""
+            self.state = "PASS"
+        elif self.scan_buf:
+            out.append(self._text_delta(self.scan_buf))     # 懒开
+            self.scan_buf = ""
+            if self.cur_out is not None:
+                out.append(self._emit("content_block_stop",
+                          {"type": "content_block_stop", "index": self.cur_out}))
+                self.cur_out = None
+        return b"".join(out)
+
+    # ---- 合成辅助 ----
+    def _text_delta(self, text):
+        if self.cur_out is None:
+            head = self._open_text_block()
+        else:
+            head = b""
+        return head + self._emit("content_block_delta", {"type": "content_block_delta",
+                      "index": self.cur_out, "delta": {"type": "text_delta", "text": text}})
+
+    def _open_text_block(self):
+        self.cur_out = self.next_out
+        self.next_out += 1
+        self.cur_type = "text"
+        return self._emit("content_block_start", {"type": "content_block_start",
+                      "index": self.cur_out, "content_block": {"type": "text", "text": ""}})
+
+    def _text_as_new_block(self, text):
+        return self._text_delta(text) + self._emit("content_block_stop",
+                      {"type": "content_block_stop", "index": self.cur_out}) + self._close_cur()
+
+    def _close_cur(self):
+        self.cur_out = None
+        return b""
+
+    def _tool_use_events(self, call):
+        idx = self.next_out
+        self.next_out += 1
+        self.tool_n += 1
+        tid = f"toolu_dsml_{self.nonce}_{self.tool_n}"
+        start = self._emit("content_block_start", {"type": "content_block_start", "index": idx,
+                    "content_block": {"type": "tool_use", "id": tid, "name": call["name"], "input": {}}})
+        delta = self._emit("content_block_delta", {"type": "content_block_delta", "index": idx,
+                    "delta": {"type": "input_json_delta",
+                              "partial_json": json.dumps(call["input"], ensure_ascii=False)}})
+        stop = self._emit("content_block_stop", {"type": "content_block_stop", "index": idx})
+        return start + delta + stop
 
     def _on_message_delta(self, obj):
         if self.synthesized:
