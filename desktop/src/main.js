@@ -76,6 +76,9 @@ function setBusy(on) {
   [els.oneClickBtn, els.stopBtn, els.saveKeyBtn, els.fetchModelsBtn, els.saveRelayBtn, els.skipVerifyBtn].forEach(
     (b) => b && (b.disabled = on)
   );
+  // 松开忙碌时，saveRelayBtn 的禁用状态交回门控（requires_model_override 未选模型仍应禁用），
+  // 避免 setBusy(false) 覆盖 refreshSaveGate 刚算好的门控（修 Task12 review Important）。
+  if (!on) refreshSaveGate();
 }
 
 async function call(cmd, args) {
