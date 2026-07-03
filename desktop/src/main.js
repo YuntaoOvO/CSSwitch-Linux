@@ -479,6 +479,11 @@ function reflectPreset() {
   els.keyInput.placeholder = maskedKey ? "已存：" + maskedKey : "粘贴中转站 key / token（只存本地）";
   // 模型下拉：先用 builtin ∪ 已存 model 铺（无需触网）。
   const builtin = (p.builtin_models || []).map((id) => ({ id, supports_tools: null }));
+  // 已存 model 若不在 builtin 里（多来自实时 /v1/models 拉取，如 OpenRouter 数百模型），也补进下拉；
+  // 否则 relaunch 后 value 选不中会回落空值，一键开始时非 requires 预设(GLM/OpenRouter)会把已存模型静默改成透传。
+  if (saved.model && !builtin.some((m) => m.id === saved.model)) {
+    builtin.push({ id: saved.model, supports_tools: null });
+  }
   renderModelSelect(builtin, p.requires_model_override, "内置");
   if (saved.model) els.relayModel.value = saved.model;
   els.relayModelHint.textContent = p.requires_model_override
