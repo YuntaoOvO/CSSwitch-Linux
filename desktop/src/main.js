@@ -203,19 +203,15 @@ function reflectProvider() {
     ? "粘贴中转站 key / token（只存本地）"
     : "粘贴第三方 key（只存本地）";
   updateRelayUI();
+  if (els.provider.value === "relay") reflectPreset();
 }
 
 function currentSettings() {
-  const s = {
+  return {
     provider: els.provider.value === "relay" ? currentPresetId() : els.provider.value,
     proxy_port: parseInt(els.proxyPort.value, 10) || 18991,
     sandbox_port: parseInt(els.sandboxPort.value, 10) || 8990,
   };
-  // 只在中转站模式带 base_url（后端据「有无该字段」决定是否改动已存值）。
-  if (els.provider.value === "relay") {
-    s.base_url = els.relayBase.value.trim();
-  }
-  return s;
 }
 
 // 保存设置：失败会【抛出】，让调用方（起代理 / 一键登录）中止，
@@ -354,6 +350,24 @@ async function oneClick() {
       els.keyInput.value = "";
       reflectProvider();
     }
+    // 中转站模式：先把面板里未提交的 base_url/model/key 事务化落盘（复发防护），
+    // 失败则中止一键（不带半套配置起链路）。
+    if (els.provider.value === "relay") {
+      const p = currentPreset();
+      const base = p.base_url_editable ? els.relayBase.value.trim() : p.base_url;
+      const model = els.relayModel.value;
+      const r = await call("save_relay_config", {
+        req: { preset: p.id, base_url: base, key: els.keyInput.value.trim(), model, skip_verify: false },
+      });
+      if (!r || !r.committed) {
+        setMsg((r && r.hint) || "中转站配置未通过验证，未启动。", "err");
+        setBusy(false);
+        return;
+      }
+      els.keyInput.value = "";
+      const cfg = await call("get_config");
+      relayCfg = cfg.relay || {};
+    }
     await persistSettings();
     const r = await call("one_click_login");
     // 透传后端据实回传的 msg（区分：已重新打开 / 已用新配置重启 / 沿用原有对话 / 已启动 /
@@ -464,7 +478,43 @@ function reflectPreset() {
     : "留「（透传）」则用 Science 选择器里的模型（claude-* 直传）。";
   refreshSaveGate();
 }
-async function saveRelay(_skip) { /* Task 13 填充 */ }
+async function saveRelay(skip) {
+  const p = currentPreset();
+  if (!p) return;
+  const base = p.base_url_editable ? els.relayBase.value.trim() : p.base_url;
+  const model = els.relayModel.value; // 空=透传（仅非 requires 预设可）
+  if (p.requires_model_override && !model) {
+    setMsg("该中转站需要选一个模型才能保存。", "err");
+    return;
+  }
+  setBusy(true);
+  setMsg(skip ? "跳过验证保存中…" : "保存中：起临时代理验证候选配置…");
+  try {
+    const key = els.keyInput.value.trim(); // 有新 key 就带上；空=后端沿用已存
+    const r = await call("save_relay_config", {
+      req: { preset: p.id, base_url: base, key, model, skip_verify: !!skip },
+    });
+    if (r && r.committed) {
+      setMsg((r.hint || "已保存。") + " 点「一键开始」即可。", "ok");
+      els.skipVerifyBtn.hidden = true;
+      // 提交即清空 key 输入 + 刷新掩码/已存值（安全：完整 key 不留在 renderer）。
+      els.keyInput.value = "";
+      const cfg = await call("get_config");
+      relayCfg = cfg.relay || {};
+      reflectPreset();
+    } else {
+      setMsg(r && r.hint ? r.hint : "未保存。", "err");
+      // 含糊态：露出「跳过验证保存」。
+      els.skipVerifyBtn.hidden = !(r && r.can_skip);
+    }
+    await refreshStatus();
+  } catch (e) {
+    setMsg("保存失败：" + e, "err");
+  } finally {
+    setBusy(false);
+    refreshSaveGate();
+  }
+}
 
 function wire() {
   [
