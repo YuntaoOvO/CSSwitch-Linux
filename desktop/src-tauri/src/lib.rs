@@ -28,7 +28,31 @@ use serde::Deserialize;
 use serde_json::json;
 use tauri::{Manager, State};
 
-const SCIENCE_BIN: &str = "/Applications/Claude Science.app/Contents/Resources/bin/claude-science";
+/// Science 二进制路径：优先 `SCIENCE_BIN` 环境变量，否则按平台默认。
+fn science_bin() -> String {
+    if let Ok(s) = std::env::var("SCIENCE_BIN") {
+        if !s.is_empty() {
+            return s;
+        }
+    }
+    if cfg!(target_os = "macos") {
+        "/Applications/Claude Science.app/Contents/Resources/bin/claude-science".to_string()
+    } else {
+        // Linux：优先从 PATH 找，回退 ~/.local/bin
+        if let Ok(home) = std::env::var("HOME") {
+            let default = format!("{home}/.local/bin/claude-science");
+            if Path::new(&default).is_file() {
+                return default;
+            }
+        }
+        "/usr/local/bin/claude-science".to_string()
+    }
+}
+
+/// 用于跑脚本的 shell：优先 $SHELL，回退 bash。
+fn system_shell() -> String {
+    std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string())
+}
 
 #[derive(Default)]
 struct AppState {
@@ -250,14 +274,19 @@ fn lock(m: &Mutex<AppState>) -> std::sync::MutexGuard<'_, AppState> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// 用系统浏览器打开 URL（macOS `open`）。校验退出码：非零视为失败（P2c）。
+/// 用系统浏览器打开 URL。macOS 用 `open`，Linux 用 `xdg-open`。校验退出码：非零视为失败（P2c）。
 fn open_in_browser(url: &str) -> Result<(), String> {
-    let st = Command::new("open")
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let st = Command::new(opener)
         .arg(url)
         .status()
         .map_err(|e| format!("打开浏览器失败：{e}"))?;
     if !st.success() {
-        return Err(format!("open 非零退出（{:?}）", st.code()));
+        return Err(format!("{opener} 非零退出（{:?}）", st.code()));
     }
     Ok(())
 }
@@ -382,7 +411,11 @@ fn start_proxy_for(
     let root = asset_root(app)
         .ok_or("找不到代理脚本 proxy/csswitch_proxy.py（打包资源或仓库根均未命中）。开发态可设 CSSWITCH_REPO。")?;
     let py = proc::find_exe("python3")
-        .ok_or("缺少依赖 python3（起翻译代理需要）。已查 PATH、常见目录与登录 shell 仍未找到；macOS 一般自带 /usr/bin/python3（装 Xcode 命令行工具：xcode-select --install）。")?;
+        .ok_or(if cfg!(target_os = "macos") {
+            "缺少依赖 python3（起翻译代理需要）。已查 PATH、常见目录与登录 shell 仍未找到；macOS 一般自带 /usr/bin/python3（装 Xcode 命令行工具：xcode-select --install）。"
+        } else {
+            "缺少依赖 python3（起翻译代理需要）。已查 PATH、常见目录与登录 shell 仍未找到；Linux 请用包管理器安装 python3（如 apt install python3 / dnf install python3）。"
+        })?;
 
     // path-secret：**持久化复用**（已在跑的沙箱把该 secret 嵌进了 ANTHROPIC_BASE_URL，
     // 若每次起代理都换 secret，代理一重启沙箱就会拿旧 secret 打到新代理 → 全部 403）。
@@ -499,7 +532,8 @@ fn stop_sandbox_inner(app: &tauri::AppHandle, st: &mut AppState) -> Result<(), S
         Some(root) => {
             let stop = root.join("scripts/stop-science-sandbox.sh");
             if stop.is_file() {
-                match Command::new("zsh")
+                let shell = system_shell();
+                match Command::new(&shell)
                     .arg(&stop)
                     .env("SANDBOX_HOME", sandbox_home())
                     .stdout(Stdio::null())
@@ -760,20 +794,33 @@ fn set_mode(
 /// 官方模式：干净地打开用户【真实】的 Claude Science（不碰/复制真实凭证，抹掉 ANTHROPIC_*）。
 #[tauri::command]
 fn open_official() -> Result<(), String> {
-    let app_path = "/Applications/Claude Science.app";
-    let mut cmd = Command::new("open");
-    if Path::new(app_path).is_dir() {
-        cmd.arg(app_path);
+    if cfg!(target_os = "macos") {
+        let app_path = "/Applications/Claude Science.app";
+        let mut cmd = Command::new("open");
+        if Path::new(app_path).is_dir() {
+            cmd.arg(app_path);
+        } else {
+            cmd.arg("-a").arg("Claude Science");
+        }
+        cmd.env_remove("ANTHROPIC_BASE_URL")
+            .env_remove("ANTHROPIC_API_KEY")
+            .env_remove("ANTHROPIC_AUTH_TOKEN");
+        match cmd.status() {
+            Ok(s) if s.success() => Ok(()),
+            Ok(_) => Err("未能打开 Claude Science。请确认已安装官方 Claude Science。".into()),
+            Err(e) => Err(format!("打开官方 Claude Science 失败：{e}")),
+        }
     } else {
-        cmd.arg("-a").arg("Claude Science");
-    }
-    cmd.env_remove("ANTHROPIC_BASE_URL")
-        .env_remove("ANTHROPIC_API_KEY")
-        .env_remove("ANTHROPIC_AUTH_TOKEN");
-    match cmd.status() {
-        Ok(s) if s.success() => Ok(()),
-        Ok(_) => Err("未能打开 Claude Science。请确认已安装官方 Claude Science。".into()),
-        Err(e) => Err(format!("打开官方 Claude Science 失败：{e}")),
+        // Linux：直接启动 science 二进制（抹掉 ANTHROPIC_* 环境变量）
+        let bin = science_bin();
+        let mut cmd = Command::new(&bin);
+        cmd.env_remove("ANTHROPIC_BASE_URL")
+            .env_remove("ANTHROPIC_API_KEY")
+            .env_remove("ANTHROPIC_AUTH_TOKEN");
+        match cmd.spawn() {
+            Ok(_) => Ok(()),
+            Err(e) => Err(format!("启动 Claude Science 失败（{bin}）：{e}")),
+        }
     }
 }
 
@@ -1633,7 +1680,8 @@ fn one_click_login_inner(
         );
     }
     let logf2 = logf.try_clone().map_err(|e| e.to_string())?;
-    let status = Command::new("zsh")
+    let shell = system_shell();
+    let status = Command::new(&shell)
         .arg(&launch)
         .arg("--port")
         .arg(sport.to_string())
@@ -1715,8 +1763,9 @@ fn first_http_url(stdout: &str) -> Option<String> {
 fn sandbox_url(port: u16) -> String {
     let home = sandbox_home();
     let data_dir = home.join(".claude-science");
-    if Path::new(SCIENCE_BIN).is_file() {
-        if let Ok(out) = Command::new(SCIENCE_BIN)
+    let bin = science_bin();
+    if Path::new(&bin).is_file() {
+        if let Ok(out) = Command::new(&bin)
             .arg("url")
             .arg("--data-dir")
             .arg(&data_dir)
@@ -1737,8 +1786,9 @@ fn sandbox_url(port: u16) -> String {
 fn sandbox_running_ours(port: u16) -> bool {
     let home = sandbox_home();
     let data_dir = home.join(".claude-science");
-    if Path::new(SCIENCE_BIN).is_file() {
-        match Command::new(SCIENCE_BIN)
+    let bin = science_bin();
+    if Path::new(&bin).is_file() {
+        match Command::new(&bin)
             .arg("status")
             .arg("--data-dir")
             .arg(&data_dir)
@@ -1859,12 +1909,13 @@ fn report_bug() -> Result<(), String> {
     open_in_browser("https://github.com/SuperJJ007/CSSwitch/issues/new?template=bug_report.yml")
 }
 
-/// 在访达里打开日志目录 `~/.csswitch/logs`，方便用户附到 bug 反馈里（先自查有无密钥）。
+/// 在文件管理器里打开日志目录 `~/.csswitch/logs`，方便用户附到 bug 反馈里（先自查有无密钥）。
 #[tauri::command]
 fn open_logs() -> Result<(), String> {
     let dir = config::default_dir().join("logs");
     let _ = std::fs::create_dir_all(&dir);
-    Command::new("open")
+    let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    Command::new(opener)
         .arg(&dir)
         .status()
         .map_err(|e| format!("打开日志目录失败：{e}"))?;

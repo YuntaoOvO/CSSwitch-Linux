@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "CSSwitch",
-  "version": "0.3.2",
-  "identifier": "com.csswitch.menubar",
+  "productName": "CSSwitch-Linux",
+  "version": "1.0.0",
+  "identifier": "com.csswitch-linux.app",
   "build": {
     "frontendDist": "../src"
   },
@@ -11,7 +11,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "CSSwitch",
+        "title": "CSSwitch-Linux",
         "width": 420,
         "height": 700,
         "minWidth": 380,
@@ -44,6 +44,7 @@
     },
     "macOS": {
       "signingIdentity": "-"
-    }
+    },
+    "linux": {}
   }
 }

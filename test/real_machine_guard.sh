@@ -13,7 +13,14 @@ STATE_DIR="$TEST_ROOT/state"
 BASELINE="$STATE_DIR/port-8765.pids"
 PROXY_PORT="${CSSWITCH_TEST_PROXY_PORT:-18991}"
 SANDBOX_PORT="${CSSWITCH_TEST_SANDBOX_PORT:-8990}"
-SCIENCE_BIN="${SCIENCE_BIN:-/Applications/Claude Science.app/Contents/Resources/bin/claude-science}"
+# 平台检测：默认 Science 二进制路径
+OS="$(uname -s)"
+if [[ "$OS" == "Darwin" ]]; then
+  DEFAULT_SCIENCE_BIN="/Applications/Claude Science.app/Contents/Resources/bin/claude-science"
+else
+  DEFAULT_SCIENCE_BIN="$HOME/.local/bin/claude-science"
+fi
+SCIENCE_BIN="${SCIENCE_BIN:-$DEFAULT_SCIENCE_BIN}"
 
 die() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "PASS: $*"; }

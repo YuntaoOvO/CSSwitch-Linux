@@ -4,6 +4,25 @@
 
 > **约定**：已修问题从 [`docs/known-issues.md`](docs/known-issues.md)「毕业」到这里（发布即定稿）；未修/进行中留在 known-issues；硬 bug 的根因证据链存在 [`findings/`](findings/)。
 
+## [1.0.0] — 2026-07-04
+
+> **CSSwitch-Linux 首发**：基于原项目 v0.3.2 完整移植到 Linux 平台。
+
+### 新增 Added
+- **Linux 平台支持**：所有 shell 脚本适配 bash，平台检测自动选择正确的 Science 二进制路径（macOS `/Applications/...` vs Linux `~/.local/bin/claude-science`）。
+- **Linux 桌面 app 构建**：Tauri 2 增加 Linux bundle 配置，产出 `.deb`、`.rpm`、`.AppImage` 三种格式。
+- **systemd 维护巡检**：新增 `scripts/install-maintenance-systemd.sh` 及配套 `.service` / `.timer` 文件，替代 macOS 的 launchd 方案。
+- **SCIENCE_BIN 环境变量**：所有脚本和 Rust 后端均支持通过 `SCIENCE_BIN` 覆盖 Science 二进制路径。
+
+### 变更 Changed
+- **Shell 脚本**：全部从 `#!/bin/zsh` 改为 `#!/usr/bin/env bash`，移除 zsh 特有语法（`${0:A:h}`、`${pipestatus}` 等）。
+- **Rust 后端**：`open` 命令在 Linux 上自动切换为 `xdg-open`；zsh 调用改为 `$SHELL` 自动检测；`common_bin_dirs()` 增加 Linux 路径。
+- **README**：面向 Linux 用户重写安装说明，增加已知问题章节。
+
+### 已知问题 Known Issues
+- **「设为当前」和「一键开始」时可能有短暂卡顿**：首次校验 Key 或启动代理时，上游网络探测和 Python 代理冷启动可能需要几秒，界面短暂无响应属于正常现象。
+- macOS Keychain 功能在 Linux 上自动跳过，不影响使用。
+
 ## [0.3.2] — 2026-07-04
 
 > 主题：**Science 顶部显示真实模型名 + 新增 Kimi / MiniMax**。修复 relay 家在 Science 模型选择器里笼统显示「claude / opus」的问题（#11），让每个服务商都能选择或自填模型、并在 Science 里显示真实模型名；新增 Kimi（Moonshot）与 MiniMax；各家内置模型更新到官方主流版本。

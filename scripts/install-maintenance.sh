@@ -1,13 +1,21 @@
 #!/bin/bash
-# 安装/卸载/查看 CSSwitch 每日维护巡检 launchd agent。
+# 安装/卸载/查看 CSSwitch 每日维护巡检 launchd agent（仅 macOS）。
+# Linux 请使用 install-maintenance-systemd.sh。
 #   scripts/install-maintenance.sh install     # 拷 plist 到 ~/Library/LaunchAgents 并加载
 #   scripts/install-maintenance.sh uninstall   # 卸载并删除
 #   scripts/install-maintenance.sh status      # 查看是否已加载 + 最近日志
 #   scripts/install-maintenance.sh run         # 立刻手动跑一次（走 launchd）
 set -euo pipefail
 
+if [[ "$(uname -s)" != "Darwin" ]]; then
+  echo "此脚本仅用于 macOS (launchd)。Linux 请使用 install-maintenance-systemd.sh (systemd timer)。" >&2
+  exit 1
+fi
+
+# 仓库根：自动检测，不再硬编码机器特定路径。
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+
 LABEL="com.csswitch.maintenance"
-REPO="/Users/superjj/ccproj/CSswitch"
 SRC="$REPO/scripts/com.csswitch.maintenance.plist"
 DST="$HOME/Library/LaunchAgents/$LABEL.plist"
 DOMAIN="gui/$(id -u)"

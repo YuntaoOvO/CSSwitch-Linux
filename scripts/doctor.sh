@@ -15,7 +15,14 @@ KEY_PRESENT="${CSSWITCH_KEY_PRESENT:-0}"
 PROXY_PORT="${CSSWITCH_PROXY_PORT:-18991}"
 SANDBOX_PORT="${CSSWITCH_SANDBOX_PORT:-8990}"
 CONFIG="${CSSWITCH_CONFIG:-$HOME/.csswitch/config.json}"
-SCIENCE_BIN="${SCIENCE_BIN:-/Applications/Claude Science.app/Contents/Resources/bin/claude-science}"
+# 平台检测：默认 Science 二进制路径
+OS="$(uname -s)"
+if [[ "$OS" == "Darwin" ]]; then
+  DEFAULT_SCIENCE_BIN="/Applications/Claude Science.app/Contents/Resources/bin/claude-science"
+else
+  DEFAULT_SCIENCE_BIN="$HOME/.local/bin/claude-science"
+fi
+SCIENCE_BIN="${SCIENCE_BIN:-$DEFAULT_SCIENCE_BIN}"
 REAL_DIR="$HOME/.claude-science"
 
 WARN=0; FAIL=0

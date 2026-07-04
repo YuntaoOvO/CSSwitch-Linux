@@ -1,22 +1,24 @@
 #!/bin/bash
-# CSSwitch 每日维护巡检 —— 由 launchd 每天 09:00 / 21:00 触发（Asia/Shanghai）。
+# CSSwitch 每日维护巡检 —— 由 launchd (macOS) / systemd timer (Linux) 每天 09:00 / 21:00 触发（Asia/Shanghai）。
 # 无人值守地跑一个受限 `claude -p` session：只读仓库 + 抓公开网页 + 把巡检报告写进
 # findings/auto-maint/。绝不改代码、不提交、不推送、不碰 ~/.claude-science、不启动任何 Science。
 # 详见 scripts/daily-maintenance.prompt.md。
 #
 # 手动测试：bash scripts/daily-maintenance.sh
-# 安装/卸载定时：scripts/install-maintenance.sh {install|uninstall|status}
+# macOS 安装/卸载定时：scripts/install-maintenance.sh {install|uninstall|status}
+# Linux 安装/卸载定时：  scripts/install-maintenance-systemd.sh {install|uninstall|status}
 set -euo pipefail
 
-REPO="/Users/superjj/ccproj/CSswitch"
+# 仓库根：自动检测（从脚本位置推导），不再硬编码机器特定路径。
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
 PROMPT_FILE="$REPO/scripts/daily-maintenance.prompt.md"
 OUT_DIR="$REPO/findings/auto-maint"
 LOG_DIR="$OUT_DIR/logs"
 LOCK="$OUT_DIR/.run.lock"
 
-# launchd 给的环境极简，自己补 PATH（claude 在 ~/.local/bin）
-export PATH="/Users/superjj/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-export HOME="/Users/superjj"
+# PATH 补充：claude 常见安装位置 + 系统路径。
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin${PATH:+:$PATH}"
+export HOME="$HOME"
 
 mkdir -p "$LOG_DIR"
 STAMP="$(date +%Y%m%d-%H%M%S)"
@@ -31,12 +33,12 @@ trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT
 
 cd "$REPO"
 
-CLAUDE_BIN="$(command -v claude || echo /Users/superjj/.local/bin/claude)"
+CLAUDE_BIN="$(command -v claude || echo "$HOME/.local/bin/claude")"
 PROMPT="$(cat "$PROMPT_FILE")"
 
 {
   echo "===== CSSwitch daily-maintenance @ $STAMP ====="
-  echo "repo=$REPO branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?') claude=$CLAUDE_BIN"
+  echo "repo=$REPO branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?') claude=$CLAUDE_BIN os=$(uname -s)"
   echo "-----------------------------------------------"
 } >>"$LOG"
 
@@ -54,12 +56,12 @@ run_with_timeout "$TIMEOUT" "$CLAUDE_BIN" -p "$PROMPT" \
   --allowedTools \
     "Read Grep Glob Write Edit WebFetch WebSearch \
      Bash(git status:*) Bash(git log:*) Bash(git branch:*) Bash(git diff:*) Bash(git rev-parse:*) \
-     Bash(plutil:*) Bash(date:*) Bash(ls:*) Bash(mkdir:*) Bash(grep:*) Bash(cat:*) \
+     Bash(date:*) Bash(ls:*) Bash(mkdir:*) Bash(grep:*) Bash(cat:*) \
      Bash(head:*) Bash(tail:*) Bash(wc:*) Bash(find:*) Bash(sed:*)" \
   --disallowedTools \
     "Bash(rm:*) Bash(git commit:*) Bash(git push:*) Bash(git add:*) Bash(git checkout:*) \
      Bash(git switch:*) Bash(git reset:*) Bash(git stash:*) Bash(git branch -D:*) \
-     Read(/Users/superjj/.claude-science/**) Write(/Users/superjj/.claude-science/**) Edit(/Users/superjj/.claude-science/**)" \
+     Read($HOME/.claude-science/**) Write($HOME/.claude-science/**) Edit($HOME/.claude-science/**)" \
   >>"$LOG" 2>&1
 RC=$?
 set -e

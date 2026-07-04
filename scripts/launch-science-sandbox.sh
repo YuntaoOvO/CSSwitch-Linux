@@ -1,23 +1,34 @@
-#!/bin/zsh
+#!/usr/bin/env bash
 # 启动一个【隔离、无登录】的 Claude Science 沙箱，推理指向本项目翻译代理。
 #
 # 铁律保障（见 CLAUDE.md）:
 #   - 独立 HOME + 独立 data-dir + 独立端口，绝不碰真实 ~/.claude-science 与端口 8765
-#   - 只 APFS 克隆运行时资产（bin/conda/runtime/seed-assets），绝不复制任何登录凭证
+#   - 只克隆运行时资产（bin/conda/runtime/seed-assets），绝不复制任何登录凭证
 #     （.oauth-tokens / encryption.key / active-org.json / orgs / .key-backups）
 #   - 因此沙箱启动即【未登录】。要推理需在沙箱里【全新独立登录】（对真实登录零影响）
 #
 # 用法:
 #   scripts/launch-science-sandbox.sh [--port 8990] [--proxy-url http://127.0.0.1:18991]
 #   先在另一个终端起代理: DASHSCOPE_API_KEY=... python3 proxy/qwen_proxy.py --port 18991
+#
+# 平台：支持 macOS (Darwin) 与 Linux。
 set -euo pipefail
 
-PROJ="${0:A:h:h}"
+PROJ="$(cd "$(dirname "$0")/.." && pwd)"
 SANDBOX_HOME="$PROJ/.sandbox/home"
 DATA_DIR="$SANDBOX_HOME/.claude-science"
 REAL_DIR="$HOME/.claude-science"
-APP="/Applications/Claude Science.app/Contents/MacOS/ClaudeScience"
-BIN="/Applications/Claude Science.app/Contents/Resources/bin/claude-science"
+
+# —— 平台检测：Science 二进制路径 ——
+OS="$(uname -s)"
+if [[ "$OS" == "Darwin" ]]; then
+  APP="/Applications/Claude Science.app/Contents/MacOS/ClaudeScience"
+  DEFAULT_BIN="/Applications/Claude Science.app/Contents/Resources/bin/claude-science"
+else
+  DEFAULT_BIN="$HOME/.local/bin/claude-science"
+fi
+BIN="${SCIENCE_BIN:-$DEFAULT_BIN}"
+
 PORT=8990
 PROXY_URL="http://127.0.0.1:18991"
 
@@ -30,18 +41,23 @@ while [[ $# -gt 0 ]]; do
 done
 
 # —— 铁律断言：绝不使用真实目录 / 真实端口 ——
-_dd="${DATA_DIR:A}"; _rd="${REAL_DIR:A}"
+_dd="$(realpath "$DATA_DIR" 2>/dev/null || readlink -f "$DATA_DIR" 2>/dev/null || echo "$DATA_DIR")"
+_rd="$(realpath "$REAL_DIR" 2>/dev/null || readlink -f "$REAL_DIR" 2>/dev/null || echo "$REAL_DIR")"
 if [[ "$_dd" == "$_rd" ]]; then echo "拒绝：data-dir 的真实路径指向真实目录"; exit 1; fi
 [[ "$PORT" =~ ^[0-9]+$ ]] || { echo "拒绝：端口不是合法整数（$PORT）"; exit 1; }
 if (( 10#${PORT} == 8765 )); then echo "拒绝：端口 8765 是真实实例保留端口"; exit 1; fi
 
 # —— 首次：克隆运行时资产，绝不复制登录凭证 ——
 if [[ ! -d "$DATA_DIR/bin" ]]; then
-  echo "首次初始化沙箱运行时（APFS 克隆，只拷运行时、不拷登录）…"
+  echo "首次初始化沙箱运行时（克隆，只拷运行时、不拷登录）…"
   mkdir -p "$DATA_DIR"
   for asset in bin conda runtime seed-assets; do
     if [[ -d "$REAL_DIR/$asset" ]]; then
-      cp -Rc "$REAL_DIR/$asset" "$DATA_DIR/$asset"
+      if [[ "$OS" == "Darwin" ]]; then
+        cp -Rc "$REAL_DIR/$asset" "$DATA_DIR/$asset" 2>/dev/null || cp -R "$REAL_DIR/$asset" "$DATA_DIR/$asset"
+      else
+        cp -R "$REAL_DIR/$asset" "$DATA_DIR/$asset"
+      fi
     fi
   done
   # 明确不拷：.oauth-tokens encryption.key active-org.json orgs .key-backups install-id

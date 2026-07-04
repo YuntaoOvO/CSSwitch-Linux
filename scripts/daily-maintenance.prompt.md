@@ -12,8 +12,11 @@
 ## 本次要做的事
 
 ### 1. 检查 Claude Science 官方是否有更新
-- 读本机已装版本：`plutil -p "/Applications/Claude Science.app/Contents/Info.plist"`，
-  取 `CFBundleShortVersionString`（形如 `0.1.0-dev.20260630.t212931.sha2bc1ac8`）。
+- 读本机已装版本：
+  - **macOS**：`plutil -p "/Applications/Claude Science.app/Contents/Info.plist"`，
+    取 `CFBundleShortVersionString`（形如 `0.1.0-dev.20260630.t212931.sha2bc1ac8`）。
+  - **Linux**：`claude-science --version` 或 `~/.local/bin/claude-science --version`（若二进制有此 flag）。
+    若无 `--version`，则读二进制修改时间 `stat -c '%Y' ~/.local/bin/claude-science` 作为参考。
 - 与上次记录 `findings/auto-maint/science-version.last` 比对：
   - 文件不存在 → 视为首次，记录当前版本。
   - 版本相同 → 「本机 Science 未变化」。

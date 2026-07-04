@@ -197,20 +197,29 @@ fn find_in_dirs(name: &str, dirs: impl IntoIterator<Item = PathBuf>) -> Option<P
     None
 }
 
-/// macOS 上 node/python 等的常见安装目录（不含系统最小 PATH 已覆盖的 `/usr/bin` 等）：
-/// Homebrew(Apple Silicon / Intel)、MacPorts、volta、asdf、`~/.local/bin`，
-/// 以及 nvm 各版本 `~/.nvm/versions/node/<ver>/bin`（目录枚举）。
+/// node/python 等的常见安装目录（不含系统最小 PATH 已覆盖的 `/usr/bin` 等）。
+/// macOS：Homebrew、MacPorts、volta、asdf、~/.local/bin、nvm。
+/// Linux：/usr/local/bin、~/.local/bin、~/.cargo/bin、volta、asdf、nvm。
 fn common_bin_dirs() -> Vec<PathBuf> {
-    let mut dirs = vec![
-        PathBuf::from("/opt/homebrew/bin"), // Homebrew（Apple Silicon）
-        PathBuf::from("/usr/local/bin"),    // Homebrew（Intel）/ 手动安装
-        PathBuf::from("/opt/local/bin"),    // MacPorts
-    ];
+    let mut dirs = if cfg!(target_os = "macos") {
+        vec![
+            PathBuf::from("/opt/homebrew/bin"), // Homebrew（Apple Silicon）
+            PathBuf::from("/usr/local/bin"),    // Homebrew（Intel）/ 手动安装
+            PathBuf::from("/opt/local/bin"),    // MacPorts
+        ]
+    } else {
+        vec![
+            PathBuf::from("/usr/local/bin"), // Linux 手动安装
+        ]
+    };
     if let Some(home) = std::env::var_os("HOME") {
         let home = PathBuf::from(home);
         dirs.push(home.join(".volta/bin"));
         dirs.push(home.join(".asdf/shims"));
         dirs.push(home.join(".local/bin"));
+        if !cfg!(target_os = "macos") {
+            dirs.push(home.join(".cargo/bin")); // Rust 工具链（Linux 常见）
+        }
         // nvm：版本目录动态，枚举 ~/.nvm/versions/node/*/bin。
         if let Ok(entries) = std::fs::read_dir(home.join(".nvm/versions/node")) {
             for e in entries.flatten() {
@@ -223,10 +232,11 @@ fn common_bin_dirs() -> Vec<PathBuf> {
 
 /// [`which`] 找不到时的最后兜底：用登录 shell 解析用户的**真实 PATH**。
 ///
-/// GUI/.app 从访达启动只有最小 PATH，且用户可能用 fnm / nvm / asdf 等在 `.zshrc`
+/// GUI 从桌面启动只有最小 PATH，且用户可能用 fnm / nvm / asdf 等在 shell rc
 /// 里配置的版本管理器（[`common_bin_dirs`] 的静态枚举覆盖不到）。这里跑
-/// `zsh -lic 'command -v <name>'`（登录 + 交互 shell，会 source 用户 rc）拿其真实
+/// `$SHELL -lic 'command -v <name>'`（登录 + 交互 shell，会 source 用户 rc）拿其真实
 /// 解析路径。用独立线程 + `recv_timeout` 兜底，病态 rc 不会卡死调用方。
+/// macOS 默认 zsh，Linux 优先 $SHELL 否则回退 bash。
 pub fn which_via_login_shell(name: &str) -> Option<PathBuf> {
     // name 出自本代码（"node"/"python3"），仍做白名单，杜绝拼进 shell 的注入面。
     if name.is_empty()
@@ -237,8 +247,15 @@ pub fn which_via_login_shell(name: &str) -> Option<PathBuf> {
         return None;
     }
     let arg = format!("command -v {name} 2>/dev/null");
-    // spawn + 轮询 + 超时 kill：病态 rc 卡死时**终止** zsh，绝不泄漏线程/进程（修 P3）。
-    let mut child = Command::new("zsh")
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| {
+        if cfg!(target_os = "macos") {
+            "/bin/zsh".to_string()
+        } else {
+            "/bin/bash".to_string()
+        }
+    });
+    // spawn + 轮询 + 超时 kill：病态 rc 卡死时**终止** shell，绝不泄漏线程/进程（修 P3）。
+    let mut child = Command::new(&shell)
         .args(["-lic", &arg])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -379,20 +396,32 @@ mod tests {
     }
 
     #[test]
-    fn common_bin_dirs_covers_homebrew_and_home_managers() {
+    fn common_bin_dirs_covers_expected_paths() {
         let dirs = common_bin_dirs();
-        // Homebrew 两个前缀 + MacPorts 必在。
-        assert!(dirs
-            .iter()
-            .any(|d| d == &PathBuf::from("/opt/homebrew/bin")));
-        assert!(dirs.iter().any(|d| d == &PathBuf::from("/usr/local/bin")));
-        assert!(dirs.iter().any(|d| d == &PathBuf::from("/opt/local/bin")));
-        // HOME 存在时应含版本管理器目录（volta）。
+        if cfg!(target_os = "macos") {
+            // macOS：Homebrew 两个前缀 + MacPorts 必在。
+            assert!(dirs
+                .iter()
+                .any(|d| d == &PathBuf::from("/opt/homebrew/bin")));
+            assert!(dirs.iter().any(|d| d == &PathBuf::from("/usr/local/bin")));
+            assert!(dirs.iter().any(|d| d == &PathBuf::from("/opt/local/bin")));
+        } else {
+            // Linux：/usr/local/bin 必在。
+            assert!(dirs
+                .iter()
+                .any(|d| d == &PathBuf::from("/usr/local/bin")));
+        }
+        // HOME 存在时应含版本管理器目录（volta）与 ~/.local/bin。
         if std::env::var_os("HOME").is_some() {
             assert!(
                 dirs.iter()
                     .any(|d| d.to_string_lossy().contains(".volta/bin")),
                 "HOME 下应含 .volta/bin 兜底目录"
+            );
+            assert!(
+                dirs.iter()
+                    .any(|d| d.to_string_lossy().contains(".local/bin")),
+                "HOME 下应含 .local/bin 兜底目录"
             );
         }
     }
