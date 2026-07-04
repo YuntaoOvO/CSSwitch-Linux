@@ -110,7 +110,7 @@ static TEMPLATES: &[Template] = &[
             "deepseek-ai/DeepSeek-V4-Flash",
             "deepseek-ai/DeepSeek-V3.2",
             "zai-org/GLM-5.2",
-        ], // 官方核定 2026-07-04；⚠️ Anthropic /v1/messages 兼容待真机证实（spec 附录）
+        ], // 官方核定 2026-07-04；真机证实 api.siliconflow.cn/v1/messages 返回 Anthropic 200（relay/anthropic 配置正确，无需翻译）
         website_url: "https://siliconflow.cn",
         icon: "siliconflow",
         icon_color: "#7C3AED",
