@@ -280,6 +280,8 @@ async function loadConfig() {
     applyMode(cfg.mode === "official" ? "official" : "proxy");
     renderList();
     showView("list");
+    // 一次性迁移提示（#9 甲）：后端 get_config 读后已清盘，只会出现一次。
+    if (cfg.pending_notice) setMsg(cfg.pending_notice, "ok");
   } catch (e) {
     setMsg("读取配置失败：" + e, "err");
   }
@@ -510,7 +512,7 @@ function onWizTemplate() {
 function refreshWizGate() {
   const t = tplById(els.wizTemplate ? els.wizTemplate.value : "");
   const need = t && t.requires_model_override;
-  els.wizSaveBtn.disabled = busy || !!(need && !els.wizModel.value);
+  els.wizSaveBtn.disabled = busy || !!(need && !els.wizModel.value.trim());
 }
 
 async function wizFetch() {
@@ -537,7 +539,7 @@ async function wizSave() {
   const t = tplById(els.wizTemplate.value);
   if (!t) { setMsg("模板未加载。", "err"); return; }
   const name = els.wizName.value.trim() || t.name;
-  const model = els.wizModel.value;
+  const model = els.wizModel.value.trim();
   if (t.requires_model_override && !model) {
     setMsg("该来源需要选一个模型才能创建。", "err");
     return;
@@ -602,7 +604,7 @@ function refreshConnGate() {
   const p = currentConn();
   const t = p ? tplById(p.template_id) : null;
   const need = t && t.requires_model_override;
-  els.connSaveBtn.disabled = busy || !!(need && !els.connModel.value);
+  els.connSaveBtn.disabled = busy || !!(need && !els.connModel.value.trim());
 }
 
 async function connFetch() {
@@ -633,7 +635,7 @@ async function connSave() {
   if (!p) { setMsg("配置不存在。", "err"); return; }
   const t = tplById(p.template_id);
   const req = t ? t.requires_model_override : true;
-  const model = els.connModel.value;
+  const model = els.connModel.value.trim();
   if (req && !model) { setMsg("该来源需要选一个模型才能保存。", "err"); return; }
   const editable = t ? t.base_url_editable : true;
   const base = editable ? els.connBase.value.trim() : (t ? t.base_url : els.connBase.value.trim());
@@ -920,12 +922,12 @@ function wire() {
     const chip = e.target.closest(".chip");
     if (chip) selectWizTemplate(chip.getAttribute("data-tid"));
   });
-  els.wizModel.addEventListener("change", refreshWizGate);
+  els.wizModel.addEventListener("input", refreshWizGate); // input：键入即刷新保存门（#9 P1-b）
   els.wizFetchBtn.addEventListener("click", wizFetch);
   els.wizSaveBtn.addEventListener("click", wizSave);
   els.wizCancelBtn.addEventListener("click", cancelForm);
 
-  els.connModel.addEventListener("change", refreshConnGate);
+  els.connModel.addEventListener("input", refreshConnGate); // input：键入即刷新保存门（#9 P1-b）
   els.connFetchBtn.addEventListener("click", connFetch);
   els.connSaveBtn.addEventListener("click", connSave);
   els.connClearBtn.addEventListener("click", () => clearKey(els.connSec.dataset.id));
