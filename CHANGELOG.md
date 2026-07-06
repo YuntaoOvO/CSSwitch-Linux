@@ -4,6 +4,15 @@
 
 > **约定**：已修问题从 [`docs/known-issues.md`](docs/known-issues.md)「毕业」到这里（发布即定稿）；未修/进行中留在 known-issues；硬 bug 的根因证据链存在 [`findings/`](findings/)。
 
+## [Unreleased]
+
+### 新增 Added
+- **自定义 OpenAI Responses 兼容端点**：新增「自定义 OpenAI Responses」来源，用户填写 OpenAI 兼容 base root、模型与 key 后，代理自动拼接 `/responses` 与 `/models`，并在 Anthropic Messages 与 OpenAI Responses 之间做基础转换。
+
+### 说明 Notes
+- Responses 路径当前以非流式上游请求完成后本地回放 Anthropic SSE，尚不宣称原生 Responses SSE 增量转换。
+- Responses 路径会对 `max_output_tokens` 应用 65536 上限，并将强制工具选择保守降级为 `auto`，以兼容更严格的 Responses 兼容端点。
+
 ## [0.3.5] — 2026-07-06
 
 > 主题：**API/provider 稳定性基线**。这版把 Anthropic 兼容 provider 的关键路径拆清楚，强化 Kimi / DeepSeek / 自定义 Anthropic 等路径的流式、错误与工具调用兼容性，作为后续 provider capability / matrix 工作的稳定底座。
