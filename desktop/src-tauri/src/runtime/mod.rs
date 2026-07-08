@@ -1,3 +1,4 @@
+pub(crate) mod capability_catalog;
 pub(crate) mod diagnostics;
 pub(crate) mod model_discovery;
 pub(crate) mod operation;
