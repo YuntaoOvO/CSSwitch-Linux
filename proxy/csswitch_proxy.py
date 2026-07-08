@@ -26,19 +26,17 @@ Providers:
 import argparse
 import json
 import os
-import queue
 import re
 import select
 import socket
 import sys
-import threading
 import time
-import urllib.request
 import urllib.error
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import dsml_shim
+import http_transport
 import model_discovery
 import openai_chat_compat
 import provider_policy
@@ -175,10 +173,6 @@ RELAY_FORCE_MODEL = None
 # relay thinking 策略（来自模板 thinking_policy）：由 CSSWITCH_RELAY_THINKING 在 __main__ 装配。
 # None/"adaptive" → auto→adaptive（现状，如 MiniMax）；"enabled" → 强制 enabled（如 Kimi）。
 RELAY_THINKING = None
-# 出站 User-Agent：部分中转站的 WAF 把默认的 "Python-urllib/x.y" 判为 bot 直接 403
-# （byteswarm 实测），故所有上游请求统一带一个非 bot 的 UA。
-UPSTREAM_UA = "CSSwitch/0.2 (+https://github.com/SuperJJ007/CSSwitch)"
-
 
 @dataclass(frozen=True)
 class RuntimeState:
@@ -271,43 +265,13 @@ def _provider_state(areq, runtime=None):
 def http_post(url, data, headers, attempts=4, timeout=300):
     """POST 上游；重试覆盖【连接 + 完整读体】（含 SSL EOF、握手超时、对端断开、IncompleteRead），
     对服务端明确响应（HTTPError，如 400）不重试。返回 (body_bytes, content_type)。"""
-    headers = {"User-Agent": UPSTREAM_UA, **headers}
-    for i in range(attempts):
-        req = urllib.request.Request(url, data=data, headers=headers)
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                return r.read(), r.headers.get("Content-Type", "application/json")
-        except urllib.error.HTTPError:
-            raise
-        except Exception as e:
-            if i < attempts - 1:
-                log(f"  ~ 上游连接抖动，重试 {i + 1}/{attempts - 1}: {e}")
-                time.sleep(0.8 * (i + 1))
-                continue
-            raise
+    return http_transport.post(url, data, headers, log, attempts, timeout)
 
 
 def open_stream(url, data, headers, attempts=4, timeout=300):
     """打开上游流式连接并预读首行（把「200 但立刻空体」这种抖动也纳入重试）。
     返回 (resp, first_chunk, content_type)；首字节到手后不再重试。"""
-    headers = {"User-Agent": UPSTREAM_UA, **headers}
-    for i in range(attempts):
-        req = urllib.request.Request(url, data=data, headers=headers)
-        try:
-            r = urllib.request.urlopen(req, timeout=timeout)
-            first = r.readline(65536)
-            if not first:
-                r.close()
-                raise ConnectionError("上游 200 但立刻空体")
-            return r, first, r.headers.get("Content-Type", "application/json")
-        except urllib.error.HTTPError:
-            raise
-        except Exception as e:
-            if i < attempts - 1:
-                log(f"  ~ 上游连接抖动，重试 {i + 1}/{attempts - 1}: {e}")
-                time.sleep(0.8 * (i + 1))
-                continue
-            raise
+    return http_transport.open_stream(url, data, headers, log, attempts, timeout)
 
 
 def _open_stream_with_keepalive(write_chunk, url, data, headers):
@@ -316,42 +280,12 @@ def _open_stream_with_keepalive(write_chunk, url, data, headers):
     下游主请求可能带大量工具定义；部分上游首帧 TTFT 较长时，如果下游在这段
     时间完全收不到 body 字节，会先断开并重试。注释帧是合法 SSE，客户端应忽略内容，
     但能证明连接仍活着。"""
-    q = queue.Queue(maxsize=1)
-
-    def _open():
-        try:
-            q.put(("ok", open_stream(url, data, headers)))
-        except BaseException as e:
-            q.put(("err", e))
-
-    threading.Thread(target=_open, daemon=True).start()
-    keepalive = b": csswitch-keepalive\n\n"
-    while True:
-        try:
-            kind, payload = q.get(timeout=1.0)
-            if kind == "err":
-                raise payload
-            return payload
-        except queue.Empty:
-            write_chunk(keepalive)
+    return http_transport.open_stream_with_keepalive(write_chunk, url, data, headers, log)
 
 
 def http_get_json(url, headers, attempts=3, timeout=30):
     """GET 上游并解析 JSON（relay 回源拉 /v1/models 用）。连接抖动重试，服务端明确响应不重试。"""
-    headers = {"User-Agent": UPSTREAM_UA, **headers}
-    for i in range(attempts):
-        req = urllib.request.Request(url, headers=headers, method="GET")
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                return json.loads(r.read())
-        except urllib.error.HTTPError:
-            raise
-        except Exception as e:
-            if i < attempts - 1:
-                log(f"  ~ 上游连接抖动，重试 {i + 1}/{attempts - 1}: {e}")
-                time.sleep(0.6 * (i + 1))
-                continue
-            raise
+    return http_transport.get_json(url, headers, log, attempts, timeout)
 
 
 def normalize_openai_base(base):
