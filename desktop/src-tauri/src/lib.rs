@@ -20,7 +20,7 @@ mod runtime;
 mod scratch;
 mod templates;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -40,13 +40,16 @@ use runtime::provider::{
     proxy_args_for, proxy_fingerprint, reject_openai_custom_anthropic_base, relay_missing_base_url,
     relay_missing_model, should_scratch_candidate, upstream_host,
 };
-use runtime::proxy::{health_timeout_reason, should_write_back, ProxyAction};
-use runtime::science::{first_http_url, sandbox_home, settings_change_needs_teardown};
+use runtime::proxy::{ere_escape, health_timeout_reason, should_write_back, ProxyAction};
+use runtime::science::{
+    sandbox_home, sandbox_running_ours, sandbox_url, settings_change_needs_teardown, stop_sandbox,
+};
+use runtime::system::{
+    asset_root, kill_child, log_path, open_in_browser, open_log, redact, tail_file,
+};
 use runtime::transaction::{
     decide_switch, rollback_status_clause, skip_scratch_verify, SwitchOutcome,
 };
-
-const SCIENCE_BIN: &str = "/Applications/Claude Science.app/Contents/Resources/bin/claude-science";
 
 #[derive(Default)]
 struct AppState {
@@ -63,134 +66,16 @@ struct AppState {
     sandbox_url: Option<String>,
 }
 
-// ---------- 路径与日志 ----------
-/// 定位 CSSwitch 仓库根（含 proxy/csswitch_proxy.py）。优先 CSSWITCH_REPO，
-/// 否则从可执行文件逐级上溯。找不到返回 None。
-fn repo_root() -> Option<PathBuf> {
-    let marker = Path::new("proxy/csswitch_proxy.py");
-    if let Some(r) = std::env::var_os("CSSWITCH_REPO") {
-        if let Ok(p) = std::fs::canonicalize(PathBuf::from(r)) {
-            if p.join(marker).is_file() {
-                return Some(p);
-            }
-        }
-    }
-    // 只从【可执行文件位置】上溯。刻意不看 current_dir：启动目录可被影响，
-    // 若据此找到别处的 csswitch_proxy.py，会把带 key 的环境交给来路不明的脚本。
-    if let Ok(exe) = std::env::current_exe() {
-        let mut dir: Option<&Path> = exe.parent();
-        while let Some(d) = dir {
-            if d.join(marker).is_file() {
-                return Some(d.to_path_buf());
-            }
-            dir = d.parent();
-        }
-    }
-    None
-}
-
-/// 定位「资源根」（含 proxy/、scripts/）。打包成 .app 后 bundle 进 `Contents/Resources`；
-/// 开发态则回退到仓库根。找不到返回 None。
-fn asset_root(app: &tauri::AppHandle) -> Option<PathBuf> {
-    let marker = Path::new("proxy/csswitch_proxy.py");
-    if let Ok(res) = app.path().resource_dir() {
-        if res.join(marker).is_file() {
-            return Some(res);
-        }
-    }
-    repo_root()
-}
-
-fn log_path(name: &str) -> PathBuf {
-    config::default_dir().join("logs").join(name)
-}
-
-/// `O_NOFOLLOW` 的平台常量（本项目不引 libc）。macOS/BSD=0x0100，Linux=0x20000。
-const fn libc_o_nofollow() -> i32 {
-    if cfg!(target_os = "linux") {
-        0x2_0000
-    } else {
-        0x0100
-    }
-}
-
-/// 打开（truncate）一个子进程日志文件，父目录 0700、文件 0600（防同机其它用户读到 secret 尾巴）。
-fn open_log(name: &str) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let p = log_path(name);
-    if let Some(parent) = p.parent() {
-        config::assert_not_symlink(parent)?;
-        std::fs::create_dir_all(parent)?;
-        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
-    }
-    config::assert_not_symlink(&p)?;
-    let f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .custom_flags(libc_o_nofollow())
-        .open(&p)?;
-    let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
-    Ok(f)
-}
-
-/// 把字符串里的 secret 明文替换成 ****，用于任何要回显给前端的错误尾巴。
-fn redact(s: &str, secret: &str) -> String {
-    if secret.is_empty() {
-        s.to_string()
-    } else {
-        s.replace(secret, "****")
-    }
-}
-
-fn tail_file(path: &Path, max: usize) -> String {
-    match std::fs::read(path) {
-        Ok(b) => {
-            let start = b.len().saturating_sub(max);
-            String::from_utf8_lossy(&b[start..]).trim().to_string()
-        }
-        Err(_) => String::new(),
-    }
-}
-
-fn kill_child(slot: &mut Option<Child>) {
-    if let Some(mut c) = slot.take() {
-        let _ = c.kill();
-        let _ = c.wait();
-    }
-}
-
 /// 取锁并从 poison 中恢复：某线程持锁时 panic 不应把整个 app 卡死。
 fn lock(m: &Mutex<AppState>) -> std::sync::MutexGuard<'_, AppState> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// 用系统浏览器打开 URL（macOS `open`）。校验退出码：非零视为失败（P2c）。
-fn open_in_browser(url: &str) -> Result<(), String> {
-    let st = Command::new("open")
-        .arg(url)
-        .status()
-        .map_err(|e| format!("打开浏览器失败：{e}"))?;
-    if !st.success() {
-        return Err(format!("open 非零退出（{:?}）", st.code()));
-    }
-    Ok(())
+fn stop_sandbox_state(app: &tauri::AppHandle, st: &mut AppState) -> Result<(), String> {
+    stop_sandbox(app, &mut st.sandbox, &mut st.sandbox_url)
 }
 
 // ---------- 代理生命周期核心 ----------
-/// 转义 ERE 元字符，让路径按字面参与 `pkill -f` 匹配。
-fn ere_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 8);
-    for c in s.chars() {
-        if "\\.^$*+?()[]{}|".contains(c) {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
-}
-
 /// 确保代理在跑且健康；返回 (端口, secret, 本次动作)。幂等：已健康则复用。
 /// 读【生效 profile】派生 adapter/base_url/model/key，委托 [`start_proxy_for`]。
 fn ensure_proxy(
@@ -360,46 +245,6 @@ fn start_proxy_for(
     Ok((port, secret, ProxyAction::Restarted))
 }
 
-/// 停沙箱。返回 Err 表示 stop 脚本非零退出（Science 可能没停干净），调用方据此如实报告。
-fn stop_sandbox_inner(app: &tauri::AppHandle, st: &mut AppState) -> Result<(), String> {
-    let mut err = None;
-    match asset_root(app) {
-        Some(root) => {
-            let stop = root.join("scripts/stop-science-sandbox.sh");
-            if stop.is_file() {
-                match Command::new("zsh")
-                    .arg(&stop)
-                    .env("SANDBOX_HOME", sandbox_home())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                {
-                    Ok(s) if s.success() => {}
-                    Ok(s) => err = Some(format!("停止沙箱脚本非零退出（{:?}）。", s.code())),
-                    Err(e) => err = Some(format!("调用停止沙箱脚本失败：{e}")),
-                }
-            } else {
-                err = Some(format!(
-                    "找不到停止脚本 {}，无法确认沙箱已停止（沙箱可能仍在运行）。",
-                    stop.display()
-                ));
-            }
-        }
-        None => {
-            err = Some(
-                "定位不到资源根，取不到停止脚本，无法确认沙箱已停止（沙箱可能仍在运行）。"
-                    .to_string(),
-            );
-        }
-    }
-    kill_child(&mut st.sandbox);
-    st.sandbox_url = None;
-    match err {
-        Some(e) => Err(e),
-        None => Ok(()),
-    }
-}
-
 // ---------- Tauri commands ----------
 #[tauri::command]
 fn get_config() -> Result<serde_json::Value, String> {
@@ -431,7 +276,7 @@ fn set_mode(
         if mode == "official" {
             lifecycle.bump_generation();
             let mut st = lock(&state);
-            stop_sandbox_inner(&app, &mut st).map_err(|e| {
+            stop_sandbox_state(&app, &mut st).map_err(|e| {
                 format!("停止沙箱失败，未切换到官方模式：{e}（真实实例 8765 未受影响）")
             })?;
             kill_child(&mut st.proxy);
@@ -508,7 +353,7 @@ fn set_settings(
         // 保持端口不变则一切仍自洽（旧沙箱指旧代理端口、下次一键在旧端口重建代理，链路照通）。
         if teardown {
             let mut st = lock(&state);
-            stop_sandbox_inner(&app, &mut st).map_err(|e| {
+            stop_sandbox_state(&app, &mut st).map_err(|e| {
                 format!(
                     "端口未更改：无法停止指向旧端口的沙箱（{e}），为避免留下失效链路，端口保持不变。请手动停止沙箱或重启 app 后重试。（真实实例 8765 未受影响）"
                 )
@@ -1072,7 +917,7 @@ fn stop_all(
     lifecycle.with_serialized(|| {
         lifecycle.bump_generation(); // 作废任何在途启动（防被停后又拿旧 key 复活）
         let mut st = lock(&state);
-        let sandbox_res = stop_sandbox_inner(&app, &mut st);
+        let sandbox_res = stop_sandbox_state(&app, &mut st);
         kill_child(&mut st.proxy);
         st.secret.clear();
         st.provider.clear();
@@ -1127,7 +972,7 @@ fn one_click_login_inner(
         }
         {
             let mut st = lock(&state);
-            let _ = stop_sandbox_inner(&app, &mut st);
+            let _ = stop_sandbox_state(&app, &mut st);
         }
     }
 
@@ -1191,7 +1036,7 @@ fn one_click_login_inner(
         let tail = redact(&tail_file(&log_path("sandbox.log"), 600), &secret);
         {
             let mut st = lock(&state);
-            let _ = stop_sandbox_inner(&app, &mut st);
+            let _ = stop_sandbox_state(&app, &mut st);
         }
         return Err(format!(
             "沙箱起后探活超时（端口 {sport}）。已尝试停掉刚起的沙箱。\n{tail}"
@@ -1202,7 +1047,7 @@ fn one_click_login_inner(
     if !sandbox_running_ours(sport) {
         {
             let mut st = lock(&state);
-            let _ = stop_sandbox_inner(&app, &mut st);
+            let _ = stop_sandbox_state(&app, &mut st);
         }
         return Err(format!(
             "端口 {sport} 有服务响应，但按 data-dir 确认不是本沙箱 Science（疑似被其它服务占用）。已尝试停掉刚起的沙箱。"
@@ -1225,51 +1070,6 @@ fn one_click_login_inner(
         Err(_) => format!("{started}，服务已就绪，请手动打开：{url}"),
     };
     Ok(json!({ "url": url, "msg": msg, "action": "started" }))
-}
-
-/// 取沙箱 UI 链接：`<bin> url --data-dir <home>/.claude-science`，HOME 指向沙箱 HOME。
-fn sandbox_url(port: u16) -> String {
-    let home = sandbox_home();
-    let data_dir = home.join(".claude-science");
-    if Path::new(SCIENCE_BIN).is_file() {
-        if let Ok(out) = Command::new(SCIENCE_BIN)
-            .arg("url")
-            .arg("--data-dir")
-            .arg(&data_dir)
-            .env("HOME", &home)
-            .output()
-        {
-            let s = String::from_utf8_lossy(&out.stdout);
-            if let Some(url) = first_http_url(&s) {
-                return url;
-            }
-        }
-    }
-    format!("http://127.0.0.1:{port}")
-}
-
-/// 判断「我们自己的」沙箱 Science 是否在跑（供一键健康分派）。优先用 Science 二进制按
-/// 【我们的 data-dir】查 `{"running":true}`（强身份）；再叠加端口 /health 确认。
-fn sandbox_running_ours(port: u16) -> bool {
-    let home = sandbox_home();
-    let data_dir = home.join(".claude-science");
-    if Path::new(SCIENCE_BIN).is_file() {
-        match Command::new(SCIENCE_BIN)
-            .arg("status")
-            .arg("--data-dir")
-            .arg(&data_dir)
-            .env("HOME", &home)
-            .output()
-        {
-            Ok(out) => {
-                let s = String::from_utf8_lossy(&out.stdout);
-                let running = s.contains("\"running\":true") || s.contains("\"running\": true");
-                return running && proc::http_health(port, None, 400);
-            }
-            Err(_) => return proc::http_health(port, None, 400),
-        }
-    }
-    proc::http_health(port, None, 400)
 }
 
 #[tauri::command]

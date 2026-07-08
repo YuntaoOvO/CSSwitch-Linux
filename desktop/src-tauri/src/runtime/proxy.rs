@@ -35,9 +35,21 @@ pub(crate) fn health_timeout_reason(port: u16, tail: &str) -> String {
     }
 }
 
+/// Escape ERE metacharacters so a path can be matched literally by `pkill -f`.
+pub(crate) fn ere_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        if "\\.^$*+?()[]{}|".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{health_timeout_reason, should_write_back};
+    use super::{ere_escape, health_timeout_reason, should_write_back};
 
     #[test]
     fn should_write_back_requires_both_gen_and_secret() {
@@ -63,6 +75,14 @@ mod tests {
         assert!(
             !generic.contains("key 无效"),
             "本地探活超时与 key 有效性无关：{generic}"
+        );
+    }
+
+    #[test]
+    fn ere_escape_makes_path_literal_for_extended_regex() {
+        assert_eq!(
+            ere_escape("/tmp/a+b(proxy).py"),
+            "/tmp/a\\+b\\(proxy\\)\\.py"
         );
     }
 }
