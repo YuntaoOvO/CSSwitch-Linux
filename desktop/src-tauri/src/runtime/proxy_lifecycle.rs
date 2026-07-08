@@ -7,7 +7,7 @@ use crate::runtime::provider::{
     proxy_fingerprint,
 };
 use crate::runtime::proxy::{ere_escape, health_timeout_reason, should_write_back, ProxyAction};
-use crate::runtime::system::{asset_root, kill_child, log_path, open_log, redact, tail_file};
+use crate::runtime::system::{asset_root, log_path, open_log, redact, tail_file};
 use crate::{config, lifecycle, lock, proc, SharedAppState};
 
 /// Ensure the active profile's proxy is running and healthy.
@@ -91,9 +91,7 @@ pub(crate) fn start_proxy_for(
             return Ok((port, st.secret.clone(), ProxyAction::Reused));
         }
 
-        kill_child(&mut st.proxy);
-        st.provider.clear();
-        st.key_fp = 0;
+        st.stop_proxy();
         st.secret = secret.clone();
         let script = root.join("proxy/csswitch_proxy.py");
         let pat = format!("{}.*--port {port}", ere_escape(&script.to_string_lossy()));

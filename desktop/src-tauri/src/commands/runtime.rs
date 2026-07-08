@@ -13,7 +13,8 @@ use crate::runtime::provider::{
 };
 use crate::runtime::proxy_lifecycle::ensure_proxy;
 use crate::runtime::science::{settings_change_needs_teardown, stop_sandbox};
-use crate::runtime::system::{kill_child, open_in_browser};
+use crate::runtime::settings::validate_runtime_ports;
+use crate::runtime::system::open_in_browser;
 use crate::{config, lock, proc, run_blocking, AppState, SharedAppState, SharedLifecycle};
 
 fn stop_sandbox_state(app: &tauri::AppHandle, st: &mut AppState) -> Result<(), String> {
@@ -53,10 +54,7 @@ fn set_mode_inner(
             stop_sandbox_state(&app, &mut st).map_err(|e| {
                 format!("停止沙箱失败，未切换到官方模式：{e}（真实实例 8765 未受影响）")
             })?;
-            kill_child(&mut st.proxy);
-            st.secret.clear();
-            st.provider.clear();
-            st.key_fp = 0;
+            st.stop_proxy();
         }
         config::update(&dir, {
             let mode = mode.clone();
@@ -115,15 +113,7 @@ fn set_settings_inner(
     lifecycle: SharedLifecycle,
     cfg: UiSettings,
 ) -> Result<(), String> {
-    if cfg.proxy_port == 8765 || cfg.sandbox_port == 8765 {
-        return Err("端口 8765 是真实 Science 实例保留端口，不能用。".into());
-    }
-    if cfg.proxy_port == 0 || cfg.sandbox_port == 0 {
-        return Err("端口不能为 0。".into());
-    }
-    if cfg.proxy_port == cfg.sandbox_port {
-        return Err("代理端口与沙箱端口不能相同。".into());
-    }
+    validate_runtime_ports(cfg.proxy_port, cfg.sandbox_port)?;
     lifecycle.with_serialized(|| {
         let dir = config::default_dir();
         let old = config::load_from(&dir).map_err(|e| e.to_string())?;
@@ -144,10 +134,7 @@ fn set_settings_inner(
                 )
             })?;
             lifecycle.bump_generation(); // 停成功后作废在途启动
-            kill_child(&mut st.proxy);
-            st.secret.clear();
-            st.provider.clear();
-            st.key_fp = 0;
+            st.stop_proxy();
         }
         // 拆链路成功（或无需拆）→ 才落盘新端口，保证 config 与运行态一致。
         config::update(&dir, move |c| {
@@ -302,10 +289,7 @@ fn stop_all_inner_cmd(
         lifecycle.bump_generation(); // 作废任何在途启动（防被停后又拿旧 key 复活）
         let mut st = lock(&state);
         let sandbox_res = stop_sandbox_state(&app, &mut st);
-        kill_child(&mut st.proxy);
-        st.secret.clear();
-        st.provider.clear();
-        st.key_fp = 0;
+        st.stop_proxy();
         sandbox_res.map_err(|e| format!("代理已停；但{e}真实实例 8765 未受影响。"))
     })
 }
@@ -408,8 +392,7 @@ pub(crate) fn quit_app(
     // 默认：退 app 停代理、保留沙箱运行（spec §5.1）。
     {
         let mut st = lock(state.inner());
-        kill_child(&mut st.proxy);
-        st.secret.clear();
+        st.stop_proxy();
     }
     app.exit(0);
     Ok(())

@@ -43,6 +43,19 @@ pub(crate) struct AppState {
     pub(crate) sandbox_url: Option<String>,
 }
 
+impl AppState {
+    pub(crate) fn clear_proxy_identity(&mut self) {
+        self.secret.clear();
+        self.provider.clear();
+        self.key_fp = 0;
+    }
+
+    pub(crate) fn stop_proxy(&mut self) {
+        kill_child(&mut self.proxy);
+        self.clear_proxy_identity();
+    }
+}
+
 pub(crate) type SharedAppState = Arc<Mutex<AppState>>;
 pub(crate) type SharedLifecycle = Arc<lifecycle::Lifecycle>;
 
@@ -110,8 +123,7 @@ pub fn run() {
                     if let tauri::WindowEvent::CloseRequested { .. } = ev {
                         let state = handle.state::<SharedAppState>();
                         let mut st = lock(state.inner());
-                        kill_child(&mut st.proxy);
-                        st.secret.clear();
+                        st.stop_proxy();
                     }
                 });
             }
@@ -124,6 +136,21 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use crate::runtime::system::redact;
+    use crate::AppState;
+
+    #[test]
+    fn app_state_clear_proxy_identity_removes_runtime_credentials() {
+        let mut st = AppState {
+            secret: "secret".into(),
+            provider: "deepseek".into(),
+            key_fp: 42,
+            ..AppState::default()
+        };
+        st.clear_proxy_identity();
+        assert!(st.secret.is_empty());
+        assert!(st.provider.is_empty());
+        assert_eq!(st.key_fp, 0);
+    }
 
     #[test]
     fn redact_scrubs_secret_and_is_noop_when_empty() {

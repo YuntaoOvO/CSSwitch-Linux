@@ -11,7 +11,6 @@ use crate::runtime::provider::{
     adapter_for_profile, reject_openai_custom_anthropic_base, relay_missing_base_url,
     relay_missing_model,
 };
-use crate::runtime::system::kill_child;
 use crate::{config, lock, run_blocking, SharedAppState, SharedLifecycle};
 
 #[tauri::command]
@@ -76,9 +75,7 @@ pub(crate) fn clear_profile_key(
         if was_active {
             lifecycle.bump_generation();
             let mut st = lock(state.inner());
-            kill_child(&mut st.proxy);
-            st.provider.clear();
-            st.key_fp = 0;
+            st.stop_proxy();
         }
         Ok(())
     })
@@ -100,9 +97,7 @@ pub(crate) fn delete_profile(
         if was_active {
             lifecycle.bump_generation();
             let mut st = lock(state.inner());
-            kill_child(&mut st.proxy);
-            st.provider.clear();
-            st.key_fp = 0;
+            st.stop_proxy();
         }
         Ok(())
     })
