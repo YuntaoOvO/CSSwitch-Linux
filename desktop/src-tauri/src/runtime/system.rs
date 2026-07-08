@@ -6,6 +6,8 @@ use tauri::Manager;
 
 use crate::config;
 
+const OPERATION_LOG_MAX_BYTES: u64 = 1_048_576;
+
 /// Locate the CSSwitch repository root containing `proxy/csswitch_proxy.py`.
 /// Prefer `CSSWITCH_REPO`; otherwise walk upwards from the executable path.
 pub(crate) fn repo_root() -> Option<PathBuf> {
@@ -93,6 +95,7 @@ pub(crate) fn append_operation_log(line: &str) {
         return;
     }
     let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+    rotate_operation_log_if_needed(&p, line.len() as u64 + 1);
     let mut f = match std::fs::OpenOptions::new()
         .append(true)
         .create(true)
@@ -105,6 +108,33 @@ pub(crate) fn append_operation_log(line: &str) {
     };
     let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
     let _ = writeln!(f, "{line}");
+}
+
+fn operation_log_archive_path(p: &Path) -> PathBuf {
+    p.with_file_name("operation.log.1")
+}
+
+fn should_rotate_operation_log(current_bytes: u64, incoming_bytes: u64) -> bool {
+    current_bytes.saturating_add(incoming_bytes) > OPERATION_LOG_MAX_BYTES
+}
+
+fn rotate_operation_log_if_needed(p: &Path, incoming_bytes: u64) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Ok(md) = std::fs::metadata(p) else {
+        return;
+    };
+    if !should_rotate_operation_log(md.len(), incoming_bytes) {
+        return;
+    }
+    let archive = operation_log_archive_path(p);
+    if config::assert_not_symlink(&archive).is_err() {
+        return;
+    }
+    let _ = std::fs::remove_file(&archive);
+    if std::fs::rename(p, &archive).is_ok() {
+        let _ = std::fs::set_permissions(&archive, std::fs::Permissions::from_mode(0o600));
+    }
 }
 
 /// Redact a path-secret before returning child-process log tails to the frontend.
@@ -147,11 +177,27 @@ pub(crate) fn open_in_browser(url: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::redact;
+    use super::{operation_log_archive_path, redact, should_rotate_operation_log};
+    use std::path::Path;
 
     #[test]
     fn redact_replaces_nonempty_secret_only() {
         assert_eq!(redact("abc secret abc", "secret"), "abc **** abc");
         assert_eq!(redact("abc", ""), "abc");
+    }
+
+    #[test]
+    fn operation_log_rotation_threshold_counts_incoming_line() {
+        assert!(!should_rotate_operation_log(1_048_575, 1));
+        assert!(should_rotate_operation_log(1_048_575, 2));
+        assert!(should_rotate_operation_log(u64::MAX, 1));
+    }
+
+    #[test]
+    fn operation_log_archive_is_single_sibling_file() {
+        assert_eq!(
+            operation_log_archive_path(Path::new("/tmp/operation.log")),
+            Path::new("/tmp/operation.log.1")
+        );
     }
 }

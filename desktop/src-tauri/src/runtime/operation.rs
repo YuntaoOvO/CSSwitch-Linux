@@ -85,6 +85,7 @@ pub(crate) struct OperationTrace {
     id: String,
     kind: OperationKind,
     started: Instant,
+    last_stage_elapsed_ms: Cell<u128>,
     finished: Cell<bool>,
 }
 
@@ -99,6 +100,7 @@ impl OperationTrace {
             id: format!("{now_ms:x}-{seq:x}"),
             kind,
             started: Instant::now(),
+            last_stage_elapsed_ms: Cell::new(0),
             finished: Cell::new(false),
         };
         trace.stage(OperationStage::Precheck, detail);
@@ -106,12 +108,15 @@ impl OperationTrace {
     }
 
     pub(crate) fn stage(&self, stage: OperationStage, detail: impl AsRef<str>) {
+        let elapsed_ms = self.started.elapsed().as_millis();
+        let stage_ms = stage_delta_ms(self.last_stage_elapsed_ms.replace(elapsed_ms), elapsed_ms);
         let line = format!(
-            "op_id={} op={} stage={} elapsed_ms={} detail={}",
+            "op_id={} op={} stage={} elapsed_ms={} stage_ms={} detail={}",
             self.id,
             self.kind.as_str(),
             stage.as_str(),
-            self.started.elapsed().as_millis(),
+            elapsed_ms,
+            stage_ms,
             sanitize_detail(detail.as_ref())
         );
         append_operation_log(&line);
@@ -142,12 +147,22 @@ fn sanitize_detail(s: &str) -> String {
         .collect()
 }
 
+fn stage_delta_ms(previous_elapsed_ms: u128, elapsed_ms: u128) -> u128 {
+    elapsed_ms.saturating_sub(previous_elapsed_ms)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::sanitize_detail;
+    use super::{sanitize_detail, stage_delta_ms};
 
     #[test]
     fn sanitize_detail_keeps_log_one_line() {
         assert_eq!(sanitize_detail("a\nb\tc"), "a b c");
+    }
+
+    #[test]
+    fn stage_delta_is_since_previous_stage() {
+        assert_eq!(stage_delta_ms(10, 25), 15);
+        assert_eq!(stage_delta_ms(25, 10), 0);
     }
 }

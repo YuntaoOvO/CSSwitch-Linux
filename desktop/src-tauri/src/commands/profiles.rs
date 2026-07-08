@@ -419,7 +419,14 @@ fn set_active_profile_txn(
                 // spec §7 步 5：config 提交失败也要回滚进程——正式代理已起，若不回滚就成「运行新/盘旧」。
                 // 恢复旧 active 代理，active_id 仍为旧值，用户可重试。
                 trace.stage(OperationStage::Rollback, "reason=config_write_failed");
-                let restored = restore_proxy_for_active(app, state, lifecycle, &cfg, &old_active);
+                let restored = restore_proxy_for_active(
+                    app,
+                    state,
+                    lifecycle,
+                    &cfg,
+                    &old_active,
+                    Some(&trace),
+                );
                 trace.finish(format!("error=config_write_failed restored={restored}"));
                 return Err(format!(
                     "校验通过、代理已起，但写盘失败（{e}），{}。请检查磁盘空间/权限后重试。",
@@ -438,7 +445,8 @@ fn set_active_profile_txn(
         SwitchOutcome::RollbackToOld => {
             // 候选正式代理起/探活失败：恢复旧代理，active_id 不动，连接不落盘，不停沙箱。
             trace.stage(OperationStage::Rollback, "reason=proxy_unhealthy");
-            let restored = restore_proxy_for_active(app, state, lifecycle, &cfg, &old_active);
+            let restored =
+                restore_proxy_for_active(app, state, lifecycle, &cfg, &old_active, Some(&trace));
             let clause = rollback_status_clause(restored);
             trace.finish(format!("rollback restored={restored}"));
             if is_edit {
@@ -473,6 +481,7 @@ fn restore_proxy_for_active(
     lifecycle: &lifecycle::Lifecycle,
     cfg: &config::Config,
     old_active: &str,
+    trace: Option<&OperationTrace>,
 ) -> bool {
     if old_active.is_empty() {
         return true; // 此前无生效配置 → 本就无代理可恢复，状态与切换前一致
@@ -480,7 +489,7 @@ fn restore_proxy_for_active(
     match cfg.profile_by_id(old_active) {
         Some(old) => {
             lifecycle.bump_generation();
-            commands::runtime::start_proxy_for(app, state, lifecycle, old, None).is_ok()
+            commands::runtime::start_proxy_for(app, state, lifecycle, old, trace).is_ok()
         }
         None => false, // 旧 active 指向已不存在的 profile（罕见）→ 无法恢复，代理已停
     }

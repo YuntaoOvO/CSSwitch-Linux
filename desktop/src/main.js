@@ -285,6 +285,33 @@ function startOneClickFeedback() {
   scheduleBusyMsg(9000, { kind: "oneClick" }, "仍在等待沙箱就绪。完成后会自动打开 Science；失败会显示日志摘要。");
 }
 
+function startSwitchModeFeedback(targetMode) {
+  clearBusyMsgTimers();
+  const toOfficial = targetMode === "official";
+  setMsg(toOfficial
+    ? "正在切到官方模式：停止第三方代理/沙箱并保存模式…"
+    : "正在切到第三方模式：保存模式，完成后可选择配置并一键开始…");
+  scheduleBusyMsg(3500, { kind: "switchMode", id: targetMode }, toOfficial
+    ? "仍在停止第三方链路。真实 Claude Science 实例不会被触碰。"
+    : "仍在保存模式切换。当前不会自动启动第三方代理。");
+}
+
+function startPortSaveFeedback(changed) {
+  clearBusyMsgTimers();
+  if (changed) {
+    setMsg("正在保存端口设置：端口变化会先重置当前代理/沙箱链路…");
+    scheduleBusyMsg(3500, { kind: "ports" }, "仍在应用端口设置。若旧沙箱无法停止，端口会保持原值并显示错误。");
+    return;
+  }
+  setMsg("正在保存端口设置…");
+}
+
+function startDoctorFeedback() {
+  clearBusyMsgTimers();
+  setMsg("自检中：正在运行本地诊断脚本…");
+  scheduleBusyMsg(3500, { kind: "doctor" }, "自检仍在运行。它只检查本地依赖、端口和当前配置摘要，不会读取完整 key。");
+}
+
 function setBusy(on, op) {
   busy = on;
   busyOp = on ? (op || { kind: "global" }) : null;
@@ -293,7 +320,7 @@ function setBusy(on, op) {
     els.oneClickBtn, els.stopBtn, els.newBtn,
     els.wizSaveBtn, els.wizFetchBtn, els.wizCancelBtn,
     els.connSaveBtn, els.connFetchBtn, els.connClearBtn, els.connCancelBtn,
-    els.metaSaveBtn, els.metaCancelBtn, els.skipActivateBtn,
+    els.metaSaveBtn, els.metaCancelBtn, els.skipActivateBtn, els.doctorBtn,
     // 端口输入也纳入忙碌禁用：忙碌中改端口会与在途操作竞态（修 P1-c 前端侧）。
     els.proxyPort, els.sandboxPort,
   ].forEach((b) => b && (b.disabled = on));
@@ -430,7 +457,8 @@ function applyMode(m) {
 async function switchMode(m) {
   if (m === mode) return;
   if (busy) return; // 忙碌中不切模式（防与「一键开始」竞态；按钮亦已禁用，此为双保险）。修 P1-b
-  setBusy(true);
+  setBusy(true, { kind: "switchMode", id: m });
+  startSwitchModeFeedback(m);
   try {
     await call("set_mode", { mode: m });
   } catch (e) {
@@ -476,7 +504,8 @@ async function persistPorts() {
   const changed = p !== state.proxy_port || s !== state.sandbox_port;
   // 本次端口提交全程置忙：仅靠开头的 `if (busy) return` 只挡「已在忙时进入」，挡不住本函数在途
   // 时其它操作（切模式/一键/连接编辑）启动。置忙 + 禁用控件才能保证操作顺序符合用户预期。修 GPT 三轮 P2
-  setBusy(true);
+  setBusy(true, { kind: "ports" });
+  startPortSaveFeedback(changed);
   try {
     await call("set_settings", { cfg: { proxy_port: p, sandbox_port: s } });
     state.proxy_port = p;
@@ -485,6 +514,8 @@ async function persistPorts() {
     if (changed) {
       setMsg("端口已保存。改端口会重置正在运行的代理/沙箱，请重新「一键开始」。", "ok");
       await refreshStatus();
+    } else {
+      setMsg("端口未变化。", "ok");
     }
   } catch (e) {
     // 出错＝端口未落盘（校验不过 / 停旧沙箱失败）：把输入框还原成实际生效值，避免显示未保存的数字。
@@ -930,12 +961,16 @@ async function openBrowser() {
 }
 
 async function runDoctor() {
-  setMsg("自检中…");
+  if (busy) return;
+  setBusy(true, { kind: "doctor" });
+  startDoctorFeedback();
   try {
     const out = await call("run_doctor");
     setMsg(out, out.includes("失败 0") ? "ok" : null);
   } catch (e) {
     setMsg("自检失败：" + e, "err");
+  } finally {
+    setBusy(false);
   }
 }
 
