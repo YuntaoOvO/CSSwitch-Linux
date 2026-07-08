@@ -35,6 +35,7 @@ pub(crate) fn build_status_response(
     active_profile: serde_json::Value,
     gateway_kind: &str,
     shim_mode: &str,
+    catalog: serde_json::Value,
 ) -> serde_json::Value {
     json!({
         "proxy": lights.proxy,
@@ -45,6 +46,7 @@ pub(crate) fn build_status_response(
             "gateway_kind": gateway_kind,
             "shim_mode": shim_mode,
         },
+        "catalog": catalog,
         "last_error": null,
     })
 }
@@ -93,6 +95,12 @@ mod tests {
             }),
             "python",
             "off",
+            json!({
+                "schema_version": 1,
+                "status": "loaded",
+                "active_rules": [],
+                "boundary_rules": [],
+            }),
         );
         assert_eq!(v["proxy"], "green");
         assert_eq!(v["sandbox"], "amber");
@@ -100,6 +108,7 @@ mod tests {
         assert_eq!(v["active_profile"]["template_id"], "glm");
         assert_eq!(v["runtime"]["gateway_kind"], "python");
         assert_eq!(v["runtime"]["shim_mode"], "off");
+        assert_eq!(v["catalog"]["schema_version"], 1);
         assert!(v["last_error"].is_null());
     }
 }

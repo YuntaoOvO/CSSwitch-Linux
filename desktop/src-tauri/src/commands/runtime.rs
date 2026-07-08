@@ -5,6 +5,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tauri::State;
 
+use crate::runtime::capability_catalog::diagnostics_for_profile;
 use crate::runtime::diagnostics::{build_status_response, status_lights, StatusProbeInput};
 use crate::runtime::operation::{self, OperationKind, OperationStage, OperationTrace};
 use crate::runtime::profile::profile_capabilities;
@@ -320,7 +321,7 @@ pub(crate) fn status(state: State<'_, SharedAppState>) -> serde_json::Value {
     // 只在锁内取值，锁外做短超时探活。这里是高频 UI 状态灯，
     // 不能反复调用外部 `claude-science status`，否则前端轮询会卡住主线程。
     // 沙箱强身份确认保留在 one_click_login 的启动/复用边界。
-    let (pport, secret, sport, adapter, base_url, active_profile) = {
+    let (pport, secret, sport, adapter, base_url, active_profile, catalog_profile) = {
         let st = lock(state.inner());
         let cfg = config::load_from(&config::default_dir()).unwrap_or_default();
         let pport = if st.proxy_port != 0 {
@@ -334,7 +335,7 @@ pub(crate) fn status(state: State<'_, SharedAppState>) -> serde_json::Value {
             cfg.sandbox_port
         };
         // 上游灯读生效 profile 的 adapter/base_url；无生效配置 → 空（灯显黄，不误探）。
-        let (adapter, base_url, active_profile) = match cfg.active_profile() {
+        let (adapter, base_url, active_profile, catalog_profile) = match cfg.active_profile() {
             Some(p) => {
                 let adapter = adapter_for_profile(p).to_string();
                 (
@@ -348,9 +349,10 @@ pub(crate) fn status(state: State<'_, SharedAppState>) -> serde_json::Value {
                         "model": p.model,
                         "capabilities": profile_capabilities(p),
                     }),
+                    Some(p.clone()),
                 )
             }
-            None => (String::new(), String::new(), serde_json::Value::Null),
+            None => (String::new(), String::new(), serde_json::Value::Null, None),
         };
         (
             pport,
@@ -359,6 +361,7 @@ pub(crate) fn status(state: State<'_, SharedAppState>) -> serde_json::Value {
             adapter,
             base_url,
             active_profile,
+            catalog_profile,
         )
     };
     let uhost = upstream_host(&adapter, &base_url);
@@ -369,11 +372,13 @@ pub(crate) fn status(state: State<'_, SharedAppState>) -> serde_json::Value {
         upstream_ok: !uhost.is_empty()
             && proc::tcp_reachable(&uhost, 443, operation::STATUS_UPSTREAM_TIMEOUT_MS),
     });
+    let shim_mode = current_shim_mode_for_adapter(&adapter);
     build_status_response(
         lights,
         active_profile,
         gateway_kind_for_adapter(&adapter),
-        current_shim_mode_for_adapter(&adapter),
+        shim_mode,
+        diagnostics_for_profile(catalog_profile.as_ref(), shim_mode),
     )
 }
 
