@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::mpsc;
 use std::thread;
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
@@ -51,11 +53,16 @@ fn read_head(stream: &mut TcpStream) -> Result<RequestHead, String> {
 }
 
 fn content_length(headers: &HashMap<String, String>) -> Result<usize, String> {
-    headers
-        .get("content-length")
-        .ok_or("missing content-length".to_string())?
-        .parse::<usize>()
-        .map_err(|_| "invalid content-length".to_string())
+    let Some(raw) = headers.get("content-length") else {
+        return Ok(0);
+    };
+    let parsed = raw
+        .parse::<i64>()
+        .map_err(|_| "invalid Content-Length".to_string())?;
+    if parsed < 0 {
+        return Err("invalid Content-Length".to_string());
+    }
+    Ok(parsed as usize)
 }
 
 fn read_body(stream: &mut TcpStream, len: usize) -> Result<Vec<u8>, String> {
@@ -89,28 +96,41 @@ fn write_json(stream: &mut TcpStream, status: u16, reason: &str, value: Value) {
     write_response(stream, status, reason, "application/json", &body);
 }
 
-fn error_json(stream: &mut TcpStream, status: u16, reason: &str, detail: &str) {
+fn typed_error_json(
+    stream: &mut TcpStream,
+    status: u16,
+    reason: &str,
+    error_type: &str,
+    message: &str,
+) {
     write_json(
         stream,
         status,
         reason,
-        json!({"error": {"type": "csswitch_gateway_error", "message": detail}}),
+        json!({
+            "type": "error",
+            "error": {
+                "type": error_type,
+                "message": message,
+            },
+        }),
     );
 }
 
 fn forbidden_json(stream: &mut TcpStream) {
-    write_json(
-        stream,
-        403,
-        "Forbidden",
-        json!({
-            "type": "error",
-            "error": {
-                "type": "permission_error",
-                "message": "forbidden",
-            },
-        }),
-    );
+    typed_error_json(stream, 403, "Forbidden", "permission_error", "forbidden");
+}
+
+fn invalid_request_json(stream: &mut TcpStream, detail: &str) {
+    typed_error_json(stream, 400, "Bad Request", "invalid_request_error", detail);
+}
+
+fn not_found_json(stream: &mut TcpStream, path: &str) {
+    typed_error_json(stream, 404, "Not Found", "not_found_error", path);
+}
+
+fn api_error_json(stream: &mut TcpStream, status: u16, detail: &str) {
+    typed_error_json(stream, status, status_reason(status), "api_error", detail);
 }
 
 fn status_reason(status: u16) -> &'static str {
@@ -146,7 +166,7 @@ fn handle_get(stream: &mut TcpStream, cfg: &GatewayConfig, target: &str) {
             json!({"status": "ok", "provider": cfg.provider}),
         ),
         "/v1/models" => write_json(stream, 200, "OK", models::deepseek_models_response()),
-        _ => error_json(stream, 404, "Not Found", "not found"),
+        _ => not_found_json(stream, &path),
     }
 }
 
@@ -160,7 +180,13 @@ fn write_chunk(stream: &mut TcpStream, chunk: &[u8]) -> std::io::Result<()> {
 fn stream_error_event(detail: &str) -> Vec<u8> {
     format!(
         "event: error\ndata: {}\n\n",
-        json!({"error": {"message": detail}})
+        json!({
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": detail,
+            },
+        })
     )
     .into_bytes()
 }
@@ -170,11 +196,35 @@ fn handle_stream(stream: &mut TcpStream, cfg: &GatewayConfig, body: Vec<u8>) {
         stream,
         "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n"
     );
-    match messages::open_stream(cfg, body) {
+    let (tx, rx) = mpsc::channel();
+    let cfg_for_open = cfg.clone();
+    thread::spawn(move || {
+        let _ = tx.send(messages::open_stream(&cfg_for_open, body));
+    });
+    let upstream = loop {
+        match rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(result) => break result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if write_chunk(stream, b": csswitch-keepalive\n\n").is_err() {
+                    return;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                break Err(messages::UpstreamError {
+                    status: 502,
+                    detail: "upstream stream failed".to_string(),
+                });
+            }
+        }
+    };
+    match upstream {
         Ok(mut upstream) => {
+            if write_chunk(stream, &upstream.first).is_err() {
+                return;
+            }
             let mut buf = [0_u8; 8192];
             loop {
-                match upstream.read(&mut buf) {
+                match upstream.response.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
                         if write_chunk(stream, &buf[..n]).is_err() {
@@ -200,7 +250,7 @@ fn handle_messages(stream: &mut TcpStream, cfg: &GatewayConfig, body: Vec<u8>) {
     let raw: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
-            error_json(stream, 400, "Bad Request", &e.to_string());
+            invalid_request_json(stream, &e.to_string());
             return;
         }
     };
@@ -208,7 +258,7 @@ fn handle_messages(stream: &mut TcpStream, cfg: &GatewayConfig, body: Vec<u8>) {
     let transformed = match policy::transform_request(raw) {
         Ok(body) => body,
         Err(e) => {
-            error_json(stream, 400, "Bad Request", &e);
+            invalid_request_json(stream, &e);
             return;
         }
     };
@@ -224,7 +274,7 @@ fn handle_messages(stream: &mut TcpStream, cfg: &GatewayConfig, body: Vec<u8>) {
             &resp.content_type,
             &resp.body,
         ),
-        Err(e) => error_json(stream, e.status, status_reason(e.status), &e.detail),
+        Err(e) => api_error_json(stream, e.status, &e.detail),
     }
 }
 
@@ -236,24 +286,28 @@ fn handle_post(stream: &mut TcpStream, cfg: &GatewayConfig, target: &str, head: 
             return;
         }
     };
-    if path != "/v1/messages" {
-        error_json(stream, 404, "Not Found", "not found");
-        return;
-    }
     let len = match content_length(&head.headers) {
         Ok(len) => len,
         Err(e) => {
-            error_json(stream, 400, "Bad Request", &e);
+            invalid_request_json(stream, &e);
             return;
         }
     };
-    let body = match read_body(stream, len) {
-        Ok(body) => body,
-        Err(e) => {
-            error_json(stream, 400, "Bad Request", &e);
-            return;
+    let body = if len == 0 {
+        b"{}".to_vec()
+    } else {
+        match read_body(stream, len) {
+            Ok(body) => body,
+            Err(e) => {
+                invalid_request_json(stream, &e);
+                return;
+            }
         }
     };
+    if path != "/v1/messages" {
+        not_found_json(stream, &path);
+        return;
+    }
     handle_messages(stream, cfg, body);
 }
 
@@ -261,7 +315,7 @@ fn handle_one(cfg: GatewayConfig, mut stream: TcpStream) {
     let head = match read_head(&mut stream) {
         Ok(head) => head,
         Err(e) => {
-            error_json(&mut stream, 400, "Bad Request", &e);
+            invalid_request_json(&mut stream, &e);
             return;
         }
     };
@@ -272,7 +326,7 @@ fn handle_one(cfg: GatewayConfig, mut stream: TcpStream) {
             let target = head.target.clone();
             handle_post(&mut stream, &cfg, &target, &head)
         }
-        _ => error_json(&mut stream, 404, "Not Found", "not found"),
+        _ => not_found_json(&mut stream, &head.target),
     }
 }
 

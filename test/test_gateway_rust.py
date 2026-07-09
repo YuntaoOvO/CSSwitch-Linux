@@ -46,13 +46,54 @@ def recv_http_head(sock):
     return data
 
 
+def recv_http_all(sock):
+    chunks = []
+    while True:
+        try:
+            chunk = sock.recv(65536)
+        except ConnectionResetError:
+            break
+        if not chunk:
+            break
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def parse_raw_response(raw):
+    head, _, body = raw.partition(b"\r\n\r\n")
+    lines = head.split(b"\r\n")
+    status = int(lines[0].split()[1])
+    headers = {}
+    for line in lines[1:]:
+        key, _, value = line.partition(b":")
+        if key:
+            headers[key.strip().lower().decode()] = value.strip().decode()
+    return status, headers, body
+
+
+def assert_error_shape(testcase, body, error_type):
+    parsed = json.loads(body)
+    testcase.assertEqual(parsed["type"], "error")
+    testcase.assertEqual(parsed["error"]["type"], error_type)
+    testcase.assertIsInstance(parsed["error"]["message"], str)
+    return parsed
+
+
 class MockUpstream(ThreadingHTTPServer):
     allow_reuse_address = True
 
-    def __init__(self, response_body, content_type="application/json"):
+    def __init__(
+        self,
+        response_body,
+        content_type="application/json",
+        status=200,
+        response_delay=0,
+    ):
         self.requests = []
         self.response_body = response_body
         self.content_type = content_type
+        self.status = status
+        self.response_delay = response_delay
         super().__init__(("127.0.0.1", free_port()), MockHandler)
 
 
@@ -70,7 +111,9 @@ class MockHandler(BaseHTTPRequestHandler):
             }
         )
         payload = self.server.response_body
-        self.send_response(200)
+        if self.server.response_delay:
+            time.sleep(self.server.response_delay)
+        self.send_response(self.server.status)
         self.send_header("content-type", self.server.content_type)
         self.send_header("content-length", str(len(payload)))
         self.end_headers()
@@ -98,6 +141,73 @@ class EchoServer:
             with conn:
                 data = conn.recv(4096)
                 conn.sendall(data)
+
+
+class RawUpstream:
+    def __init__(self, handler):
+        self.port = free_port()
+        self.handler = handler
+        self.ready = threading.Event()
+        self.closed = False
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+        self.thread.start()
+        self.ready.wait(2)
+
+    def _serve(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind(("127.0.0.1", self.port))
+            srv.listen(5)
+            self.ready.set()
+            while not self.closed:
+                try:
+                    conn, _ = srv.accept()
+                except OSError:
+                    return
+                threading.Thread(target=self.handler, args=(conn,), daemon=True).start()
+
+    @property
+    def url(self):
+        return f"http://127.0.0.1:{self.port}/anthropic/v1/messages"
+
+    def close(self):
+        self.closed = True
+        try:
+            with socket.create_connection(("127.0.0.1", self.port), timeout=0.2):
+                pass
+        except OSError:
+            pass
+
+
+def delayed_stream_handler(conn):
+    with conn:
+        conn.recv(65536)
+        time.sleep(1.2)
+        head = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/event-stream\r\n"
+            "Transfer-Encoding: chunked\r\n\r\n"
+        )
+        first = b"event: message_start\n"
+        conn.sendall(head.encode() + b"15\r\n" + first + b"\r\n0\r\n\r\n")
+
+
+def dropping_stream_handler(conn):
+    with conn:
+        conn.recv(65536)
+        payload = b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\"}\n\n"
+        head = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/event-stream\r\n"
+            "Transfer-Encoding: chunked\r\n\r\n"
+        )
+        try:
+            conn.sendall(
+                head.encode() + hex(len(payload))[2:].encode() + b"\r\n" + payload + b"\r\n"
+            )
+            conn.sendall(b"1f4\r\n0123456789")
+        except BrokenPipeError:
+            pass
 
 
 class RustGatewayLoopback(unittest.TestCase):
@@ -164,6 +274,34 @@ class RustGatewayLoopback(unittest.TestCase):
         for handle in (proc.stdout, proc.stderr):
             if handle:
                 handle.close()
+
+    def raw_request(self, port, request):
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
+            sock.sendall(request)
+            return recv_http_all(sock)
+
+    def raw_post_until(self, port, body, needle, timeout=1.1):
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
+            sock.settimeout(timeout)
+            request = (
+                "POST /secret/v1/messages HTTP/1.1\r\n"
+                "Host: 127.0.0.1\r\n"
+                "Content-Type: application/json\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                "Connection: close\r\n\r\n"
+            ).encode() + body
+            started = time.monotonic()
+            sock.sendall(request)
+            chunks = []
+            try:
+                while needle not in b"".join(chunks):
+                    chunk = sock.recv(65536)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+            except socket.timeout:
+                pass
+            return b"".join(chunks), time.monotonic() - started
 
     def test_auth_and_models(self):
         proc, port = self.start_gateway()
@@ -239,6 +377,140 @@ class RustGatewayLoopback(unittest.TestCase):
             upstream.shutdown()
             upstream.server_close()
 
+    def test_nonstream_upstream_errors_match_python_shape(self):
+        cases = [
+            (401, 401),
+            (429, 429),
+            (500, 502),
+        ]
+        upstream_body = (
+            b'{"type":"error","error":{"type":"authentication_error",'
+            b'"message":"mock upstream error"}}'
+        )
+        for upstream_status, expected_status in cases:
+            with self.subTest(upstream_status=upstream_status):
+                upstream = MockUpstream(upstream_body, status=upstream_status)
+                thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+                thread.start()
+                proc, port = self.start_gateway(
+                    upstream_url=(
+                        f"http://127.0.0.1:{upstream.server_port}"
+                        "/anthropic/v1/messages"
+                    )
+                )
+                try:
+                    request_body = (
+                        b'{"model":"claude-opus-4-8",'
+                        b'"messages":[{"role":"user","content":"hi"}]}'
+                    )
+                    raw = self.raw_request(
+                        port,
+                        (
+                            b"POST /secret/v1/messages HTTP/1.1\r\n"
+                            b"Host: 127.0.0.1\r\n"
+                            b"Content-Type: application/json\r\n"
+                            + f"Content-Length: {len(request_body)}\r\n".encode()
+                            + b"Connection: close\r\n\r\n"
+                            + request_body
+                        ),
+                    )
+                    status, headers, body = parse_raw_response(raw)
+                    self.assertEqual(status, expected_status)
+                    self.assertEqual(int(headers["content-length"]), len(body))
+                    parsed = assert_error_shape(self, body, "api_error")
+                    self.assertIn(f"upstream {upstream_status}", parsed["error"]["message"])
+                finally:
+                    self.stop_gateway(proc)
+                    upstream.shutdown()
+                    upstream.server_close()
+
+    def test_malformed_requests_match_python_error_types(self):
+        proc, port = self.start_gateway()
+        try:
+            cases = [
+                (
+                    b"POST /secret/v1/messages HTTP/1.1\r\n"
+                    b"Host: 127.0.0.1\r\n"
+                    b"Content-Length: nope\r\n"
+                    b"Connection: close\r\n\r\n",
+                    400,
+                    "invalid_request_error",
+                    "invalid Content-Length",
+                ),
+                (
+                    b"POST /secret/v1/messages HTTP/1.1\r\n"
+                    b"Host: 127.0.0.1\r\n"
+                    b"Content-Length: -1\r\n"
+                    b"Connection: close\r\n\r\n",
+                    400,
+                    "invalid_request_error",
+                    "invalid Content-Length",
+                ),
+                (
+                    b"POST /secret/v1/messages HTTP/1.1\r\n"
+                    b"Host: 127.0.0.1\r\n"
+                    b"Connection: close\r\n\r\n",
+                    400,
+                    "invalid_request_error",
+                    "request body must be a JSON object",
+                ),
+                (
+                    b"POST /secret/v1/messages HTTP/1.1\r\n"
+                    b"Host: 127.0.0.1\r\n"
+                    b"Content-Length: 0\r\n"
+                    b"Connection: close\r\n\r\n",
+                    400,
+                    "invalid_request_error",
+                    "request body must be a JSON object",
+                ),
+                (
+                    b"POST /secret/v1/messages HTTP/1.1\r\n"
+                    b"Host: 127.0.0.1\r\n"
+                    b"Content-Length: 2\r\n"
+                    b"Connection: close\r\n\r\n[]",
+                    400,
+                    "invalid_request_error",
+                    "request body must be a JSON object",
+                ),
+                (
+                    b"POST /secret/v1/messages HTTP/1.1\r\n"
+                    b"Host: 127.0.0.1\r\n"
+                    b"Content-Length: 17\r\n"
+                    b"Connection: close\r\n\r\n{\"messages\":null}",
+                    400,
+                    "invalid_request_error",
+                    "request body must be a JSON object",
+                ),
+                (
+                    b"POST /secret/v1/unknown HTTP/1.1\r\n"
+                    b"Host: 127.0.0.1\r\n"
+                    b"Content-Length: 2\r\n"
+                    b"Connection: close\r\n\r\n{}",
+                    404,
+                    "not_found_error",
+                    "/v1/unknown",
+                ),
+                (
+                    b"GET /secret/nope HTTP/1.1\r\n"
+                    b"Host: 127.0.0.1\r\n"
+                    b"Connection: close\r\n\r\n",
+                    404,
+                    "not_found_error",
+                    "/nope",
+                ),
+            ]
+            for raw_request, expected_status, error_type, message_part in cases:
+                with self.subTest(error_type=error_type, message_part=message_part):
+                    status, headers, body = parse_raw_response(
+                        self.raw_request(port, raw_request)
+                    )
+                    self.assertEqual(status, expected_status)
+                    self.assertEqual(int(headers["content-length"]), len(body))
+                    parsed = assert_error_shape(self, body, error_type)
+                    self.assertIn(message_part, parsed["error"]["message"])
+        finally:
+            self.stop_gateway(proc)
+
     def test_stream_passthrough_dechunks_same_payload(self):
         payload = b"event: message_start\ndata: {\"type\":\"message_start\"}\n\n"
         upstream = MockUpstream(payload, content_type="text/event-stream")
@@ -270,6 +542,92 @@ class RustGatewayLoopback(unittest.TestCase):
             self.stop_gateway(proc)
             upstream.shutdown()
             upstream.server_close()
+
+    def test_stream_keepalive_opens_before_upstream_first_byte(self):
+        upstream = RawUpstream(delayed_stream_handler)
+        proc, port = self.start_gateway(upstream_url=upstream.url)
+        try:
+            body = (
+                b'{"model":"claude-opus-4-8","max_tokens":10,"stream":true,'
+                b'"messages":[{"role":"user","content":"hi"}]}'
+            )
+            raw, elapsed = self.raw_post_until(port, body, b": csswitch-keepalive")
+            self.assertIn(b"HTTP/1.1 200", raw)
+            self.assertIn(b"content-type: text/event-stream", raw)
+            self.assertIn(b": csswitch-keepalive", raw)
+            self.assertLess(elapsed, 1.1)
+        finally:
+            self.stop_gateway(proc)
+            upstream.close()
+
+    def test_stream_upstream_status_after_headers_is_sse_error(self):
+        upstream = MockUpstream(
+            b'{"error":"bad key"}',
+            content_type="application/json",
+            status=401,
+        )
+        thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        thread.start()
+        proc, port = self.start_gateway(
+            upstream_url=f"http://127.0.0.1:{upstream.server_port}/anthropic/v1/messages"
+        )
+        try:
+            body = (
+                b'{"model":"claude-opus-4-8","max_tokens":10,"stream":true,'
+                b'"messages":[{"role":"user","content":"hi"}]}'
+            )
+            raw = self.raw_request(
+                port,
+                (
+                    b"POST /secret/v1/messages HTTP/1.1\r\n"
+                    b"Host: 127.0.0.1\r\n"
+                    b"Content-Type: application/json\r\n"
+                    + f"Content-Length: {len(body)}\r\n".encode()
+                    + b"Connection: close\r\n\r\n"
+                    + body
+                ),
+            )
+            head, _, tail = raw.partition(b"\r\n\r\n")
+            self.assertIn(b"HTTP/1.1 200", head)
+            self.assertIn(b"content-type: text/event-stream", head)
+            self.assertIn(b"event: error", tail)
+            self.assertIn(b'"type":"api_error"', tail)
+            self.assertIn(b"upstream 401", tail)
+            self.assertTrue(raw.rstrip().endswith(b"0"))
+            self.assertNotIn(b"HTTP/1.1 401", raw)
+        finally:
+            self.stop_gateway(proc)
+            upstream.shutdown()
+            upstream.server_close()
+
+    def test_stream_midstream_truncation_ends_with_sse_error(self):
+        upstream = RawUpstream(dropping_stream_handler)
+        proc, port = self.start_gateway(upstream_url=upstream.url)
+        try:
+            body = (
+                b'{"model":"claude-opus-4-8","max_tokens":10,"stream":true,'
+                b'"messages":[{"role":"user","content":"hi"}]}'
+            )
+            raw = self.raw_request(
+                port,
+                (
+                    b"POST /secret/v1/messages HTTP/1.1\r\n"
+                    b"Host: 127.0.0.1\r\n"
+                    b"Content-Type: application/json\r\n"
+                    + f"Content-Length: {len(body)}\r\n".encode()
+                    + b"Connection: close\r\n\r\n"
+                    + body
+                ),
+            )
+            head, _, tail = raw.partition(b"\r\n\r\n")
+            self.assertIn(b"HTTP/1.1 200", head)
+            self.assertIn(b"event: content_block_delta", tail)
+            self.assertIn(b"event: error", tail)
+            self.assertIn(b'"type":"api_error"', tail)
+            self.assertTrue(raw.rstrip().endswith(b"0"))
+        finally:
+            self.stop_gateway(proc)
+            upstream.close()
 
     def test_connect_blocks_claude_hosts_and_tunnels_other_hosts(self):
         proc, port = self.start_gateway()
