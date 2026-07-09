@@ -1,15 +1,16 @@
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use tauri::Runtime;
+use tauri::{Manager, Runtime};
 
 use crate::runtime::operation::{self, OperationStage, OperationTrace, POLL_INTERVAL_MS};
 use crate::runtime::provider::{
-    assert_format_supported, is_native_adapter, is_openai_adapter, proxy_args_for,
-    proxy_fingerprint, ProxyLaunch,
+    assert_format_supported, current_shim_mode_for_adapter, gateway_kind_for_adapter,
+    is_native_adapter, is_openai_adapter, proxy_args_for, proxy_fingerprint, ProxyLaunch,
 };
 use crate::runtime::proxy::{ere_escape, health_timeout_reason, should_write_back, ProxyAction};
-use crate::runtime::system::{asset_root, log_path, open_log, redact, tail_file};
+use crate::runtime::system::{asset_root, log_path, open_log, redact, repo_root, tail_file};
 use crate::{config, lifecycle, lock, proc, SharedAppState};
 
 fn formal_proxy_env(launch: &ProxyLaunch) -> Vec<(&'static str, String)> {
@@ -35,6 +36,65 @@ fn formal_proxy_env(launch: &ProxyLaunch) -> Vec<(&'static str, String)> {
         }
     }
     env
+}
+
+fn find_gateway_in(dir: &Path) -> Option<PathBuf> {
+    let exact = dir.join(if cfg!(windows) {
+        "csswitch-gateway.exe"
+    } else {
+        "csswitch-gateway"
+    });
+    if exact.is_file() {
+        return Some(exact);
+    }
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let matches = if cfg!(windows) {
+            name.starts_with("csswitch-gateway-") && name.ends_with(".exe")
+        } else {
+            name.starts_with("csswitch-gateway-")
+        };
+        if matches && path.is_file() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn gateway_bin_path<R: Runtime>(app: &tauri::AppHandle<R>) -> Option<PathBuf> {
+    if let Some(raw) = std::env::var_os("CSSWITCH_GATEWAY_BIN") {
+        let path = PathBuf::from(raw);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent().and_then(find_gateway_in) {
+            return Some(dir);
+        }
+    }
+    if let Ok(res) = app.path().resource_dir() {
+        if let Some(path) = find_gateway_in(&res) {
+            return Some(path);
+        }
+        if let Some(path) = find_gateway_in(&res.join("binaries")) {
+            return Some(path);
+        }
+    }
+    if let Some(root) = repo_root() {
+        for dir in [
+            root.join("desktop/gateway/target/release"),
+            root.join("desktop/gateway/target/debug"),
+            root.join("desktop/src-tauri/binaries"),
+        ] {
+            if let Some(path) = find_gateway_in(&dir) {
+                return Some(path);
+            }
+        }
+    }
+    None
 }
 
 /// Ensure the active profile's proxy is running and healthy.
@@ -77,14 +137,12 @@ pub(crate) fn start_proxy_for<R: Runtime>(
         );
     }
 
+    let gateway_kind = gateway_kind_for_adapter(&launch.adapter);
+    let shim_mode = current_shim_mode_for_adapter(&launch.adapter);
     let key_fp = proxy_fingerprint(profile, &launch);
     let dir = config::default_dir();
     let cfg = config::load_from(&dir).map_err(|e| e.to_string())?;
     let port = cfg.proxy_port;
-    let root = asset_root(app)
-        .ok_or("找不到代理脚本 proxy/csswitch_proxy.py（打包资源或仓库根均未命中）。开发态可设 CSSWITCH_REPO。")?;
-    let py = proc::find_exe("python3")
-        .ok_or("缺少依赖 python3（起翻译代理需要）。已查 PATH、常见目录与登录 shell 仍未找到；macOS 一般自带 /usr/bin/python3（装 Xcode 命令行工具：xcode-select --install）。")?;
 
     let secret = if !cfg.secret.is_empty() {
         cfg.secret.clone()
@@ -102,6 +160,8 @@ pub(crate) fn start_proxy_for<R: Runtime>(
         if st.proxy.is_some()
             && st.proxy_port == port
             && st.provider == launch.adapter
+            && st.gateway_kind == gateway_kind
+            && st.shim_mode == shim_mode
             && st.key_fp == key_fp
             && proc::http_health(
                 port,
@@ -112,7 +172,10 @@ pub(crate) fn start_proxy_for<R: Runtime>(
             if let Some(t) = trace {
                 t.stage(
                     OperationStage::ProxyHealth,
-                    format!("reused port={port} adapter={}", launch.adapter),
+                    format!(
+                        "reused port={port} adapter={} gateway={gateway_kind}",
+                        launch.adapter
+                    ),
                 );
             }
             return Ok((port, st.secret.clone(), ProxyAction::Reused));
@@ -120,28 +183,53 @@ pub(crate) fn start_proxy_for<R: Runtime>(
 
         st.stop_proxy();
         st.secret = secret.clone();
-        let script = root.join("proxy/csswitch_proxy.py");
-        let pat = format!("{}.*--port {port}", ere_escape(&script.to_string_lossy()));
-        let _ = Command::new("pkill").arg("-f").arg(&pat).status();
 
         let logf = open_log("proxy.log").map_err(|e| format!("建日志失败：{e}"))?;
         let logf2 = logf.try_clone().map_err(|e| e.to_string())?;
-        let mut cmd = Command::new(&py);
         if let Some(t) = trace {
             t.stage(
                 OperationStage::ProxySpawn,
-                format!("port={port} adapter={}", launch.adapter),
+                format!(
+                    "port={port} adapter={} gateway={gateway_kind}",
+                    launch.adapter
+                ),
             );
         }
-        cmd.arg(&script)
-            .arg("--provider")
-            .arg(&launch.adapter)
-            .arg("--port")
-            .arg(port.to_string())
-            .arg("--auth-token")
-            .arg(&secret);
-        for (k, v) in formal_proxy_env(&launch) {
-            cmd.env(k, v);
+        let mut cmd = if gateway_kind == "rust" {
+            let bin = gateway_bin_path(app)
+                .ok_or("找不到 csswitch-gateway 二进制；请先构建 desktop/gateway，或设置 CSSWITCH_GATEWAY_BIN。")?;
+            let mut cmd = Command::new(bin);
+            cmd.arg("--provider")
+                .arg("deepseek")
+                .arg("--port")
+                .arg(port.to_string())
+                .arg("--auth-token")
+                .arg(&secret)
+                .env(launch.key_env, &launch.key);
+            cmd
+        } else {
+            let root = asset_root(app)
+                .ok_or("找不到代理脚本 proxy/csswitch_proxy.py（打包资源或仓库根均未命中）。开发态可设 CSSWITCH_REPO。")?;
+            let py = proc::find_exe("python3")
+                .ok_or("缺少依赖 python3（起翻译代理需要）。已查 PATH、常见目录与登录 shell 仍未找到；macOS 一般自带 /usr/bin/python3（装 Xcode 命令行工具：xcode-select --install）。")?;
+            let script = root.join("proxy/csswitch_proxy.py");
+            let pat = format!("{}.*--port {port}", ere_escape(&script.to_string_lossy()));
+            let _ = Command::new("pkill").arg("-f").arg(&pat).status();
+            let mut cmd = Command::new(&py);
+            cmd.arg(&script)
+                .arg("--provider")
+                .arg(&launch.adapter)
+                .arg("--port")
+                .arg(port.to_string())
+                .arg("--auth-token")
+                .arg(&secret);
+            for (k, v) in formal_proxy_env(&launch) {
+                cmd.env(k, v);
+            }
+            cmd
+        };
+        if gateway_kind == "rust" {
+            cmd.env("CSSWITCH_AUTH_TOKEN", &secret);
         }
         cmd.stdout(Stdio::from(logf))
             .stderr(Stdio::from(logf2))
@@ -183,6 +271,8 @@ pub(crate) fn start_proxy_for<R: Runtime>(
         st.proxy_port = port;
         st.secret = secret.clone();
         st.provider = launch.adapter.clone();
+        st.gateway_kind = gateway_kind.to_string();
+        st.shim_mode = shim_mode.to_string();
         st.key_fp = key_fp;
     }
     Ok((port, secret, ProxyAction::Restarted))
@@ -190,8 +280,10 @@ pub(crate) fn start_proxy_for<R: Runtime>(
 
 #[cfg(test)]
 mod tests {
-    use super::formal_proxy_env;
+    use super::{find_gateway_in, formal_proxy_env};
     use crate::runtime::provider::ProxyLaunch;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn launch(adapter: &str, model: &str) -> ProxyLaunch {
         launch_with_thinking(adapter, model, "")
@@ -256,5 +348,28 @@ mod tests {
     fn formal_proxy_env_preserves_relay_thinking_policy() {
         let env = formal_proxy_env(&launch_with_thinking("relay", "glm-5.2", "enabled"));
         assert!(env.contains(&("CSSWITCH_RELAY_THINKING", "enabled".to_string())));
+    }
+
+    #[test]
+    fn find_gateway_in_accepts_plain_or_tauri_suffixed_binary() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "csswitch-gateway-find-test-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let name = if cfg!(windows) {
+            "csswitch-gateway-aarch64-pc-windows-msvc.exe"
+        } else {
+            "csswitch-gateway-aarch64-apple-darwin"
+        };
+        let path = dir.join(name);
+        fs::write(&path, b"bin").unwrap();
+        assert_eq!(find_gateway_in(&dir), Some(path.clone()));
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_dir(dir);
     }
 }

@@ -25,6 +25,11 @@ else
   cargo test -- $skip_args || fail=1
 fi
 
+cd "$ROOT/desktop/gateway"
+cargo fmt --check || fail=1
+cargo clippy --all-targets -- -D warnings || fail=1
+cargo test || fail=1
+
 if [ "$fail" -ne 0 ]; then echo "S0_LAYER rust fail"; exit 1; fi
 if [ "$blocked" -ne 0 ]; then echo "S0_LAYER rust env-blocked (loopback bind tests skipped)"; exit 0; fi
 echo "S0_LAYER rust pass"; exit 0

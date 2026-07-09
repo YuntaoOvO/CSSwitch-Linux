@@ -290,6 +290,8 @@ mod tests {
         Arc::new(Mutex::new(AppState {
             secret: "runtime-secret".into(),
             provider: "deepseek".into(),
+            gateway_kind: "rust".into(),
+            shim_mode: "off".into(),
             key_fp: 42,
             ..AppState::default()
         }))
@@ -316,6 +318,8 @@ mod tests {
         let st = lock(&state);
         assert!(st.secret.is_empty());
         assert!(st.provider.is_empty());
+        assert!(st.gateway_kind.is_empty());
+        assert!(st.shim_mode.is_empty());
         assert_eq!(st.key_fp, 0);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -341,6 +345,8 @@ mod tests {
         let st = lock(&state);
         assert_eq!(st.secret, "runtime-secret");
         assert_eq!(st.provider, "deepseek");
+        assert_eq!(st.gateway_kind, "rust");
+        assert_eq!(st.shim_mode, "off");
         assert_eq!(st.key_fp, 42);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -367,6 +373,8 @@ mod tests {
         let st = lock(&state);
         assert!(st.secret.is_empty());
         assert!(st.provider.is_empty());
+        assert!(st.gateway_kind.is_empty());
+        assert!(st.shim_mode.is_empty());
         assert_eq!(st.key_fp, 0);
         let _ = fs::remove_dir_all(&dir);
     }

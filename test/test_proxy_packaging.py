@@ -81,6 +81,13 @@ class ProxyPackagingSmoke(unittest.TestCase):
             }.issubset(resources)
         )
 
+    def test_tauri_bundle_declares_rust_gateway_sidecar(self):
+        conf = json.loads(TAURI_CONF.read_text())
+        self.assertIn(
+            "binaries/csswitch-gateway",
+            conf["bundle"].get("externalBin", []),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

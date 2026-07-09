@@ -47,6 +47,30 @@ fn status_response_for_config_error(error: &dyn std::fmt::Display) -> serde_json
     )
 }
 
+fn status_runtime_identity(
+    adapter: &str,
+    secret: &str,
+    launched_gateway_kind: String,
+    launched_shim_mode: String,
+) -> (String, String, &'static str) {
+    let current_shim_mode = current_shim_mode_for_adapter(adapter);
+    let gateway_kind = if !launched_gateway_kind.is_empty() {
+        launched_gateway_kind
+    } else if !secret.is_empty() {
+        String::new()
+    } else {
+        gateway_kind_for_adapter(adapter).to_string()
+    };
+    let runtime_shim_mode = if !launched_shim_mode.is_empty() {
+        launched_shim_mode
+    } else if !secret.is_empty() {
+        String::new()
+    } else {
+        current_shim_mode.to_string()
+    };
+    (gateway_kind, runtime_shim_mode, current_shim_mode)
+}
+
 fn stop_sandbox_state(app: &tauri::AppHandle, st: &mut AppState) -> Result<(), String> {
     stop_sandbox(app, &mut st.sandbox, &mut st.sandbox_url)
 }
@@ -350,7 +374,17 @@ pub(crate) fn status(state: State<'_, SharedAppState>) -> serde_json::Value {
     // 只在锁内取值，锁外做短超时探活。这里是高频 UI 状态灯，
     // 不能反复调用外部 `claude-science status`，否则前端轮询会卡住主线程。
     // 沙箱强身份确认保留在 one_click_login 的启动/复用边界。
-    let (pport, secret, sport, adapter, base_url, active_profile, catalog_profile) = {
+    let (
+        pport,
+        secret,
+        sport,
+        adapter,
+        base_url,
+        active_profile,
+        catalog_profile,
+        launched_gateway_kind,
+        launched_shim_mode,
+    ) = {
         let st = lock(state.inner());
         let cfg = match config::load_from(&config::default_dir()) {
             Ok(cfg) => cfg,
@@ -394,6 +428,8 @@ pub(crate) fn status(state: State<'_, SharedAppState>) -> serde_json::Value {
             base_url,
             active_profile,
             catalog_profile,
+            st.gateway_kind.clone(),
+            st.shim_mode.clone(),
         )
     };
     let upstream = upstream_endpoint(&adapter, &base_url);
@@ -410,13 +446,14 @@ pub(crate) fn status(state: State<'_, SharedAppState>) -> serde_json::Value {
         sandbox_ok,
         upstream_ok,
     });
-    let shim_mode = current_shim_mode_for_adapter(&adapter);
+    let (gateway_kind, shim_mode, catalog_shim_mode) =
+        status_runtime_identity(&adapter, &secret, launched_gateway_kind, launched_shim_mode);
     build_status_response(
         lights,
         active_profile,
-        gateway_kind_for_adapter(&adapter),
-        shim_mode,
-        diagnostics_for_profile(catalog_profile.as_ref(), shim_mode),
+        &gateway_kind,
+        &shim_mode,
+        diagnostics_for_profile(catalog_profile.as_ref(), catalog_shim_mode),
         science_diagnostics(ScienceDiagnosticsInput {
             sandbox_port: sport,
             sandbox_ok,
@@ -446,7 +483,9 @@ pub(crate) fn quit_app(app: tauri::AppHandle) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{config_last_error_json, status_response_for_config_error};
+    use super::{
+        config_last_error_json, status_response_for_config_error, status_runtime_identity,
+    };
     use crate::{
         config::{self, Config, Profile},
         lifecycle, lock,
@@ -488,6 +527,27 @@ mod tests {
         assert_eq!(v["science"]["sandbox"]["port"], 0);
         assert_eq!(v["last_error"]["type"], "config_error");
         assert_eq!(v["last_error"]["message"], "bad config");
+    }
+
+    #[test]
+    fn status_runtime_identity_prefers_launched_identity_and_fail_closes_partial_launch() {
+        let (gateway, shim, catalog_shim) =
+            status_runtime_identity("deepseek", "", String::new(), String::new());
+        assert_eq!(gateway, "python");
+        assert_eq!(shim, "off");
+        assert_eq!(catalog_shim, "off");
+
+        let (gateway, shim, catalog_shim) =
+            status_runtime_identity("deepseek", "secret-present", "rust".into(), "off".into());
+        assert_eq!(gateway, "rust");
+        assert_eq!(shim, "off");
+        assert_eq!(catalog_shim, "off");
+
+        let (gateway, shim, catalog_shim) =
+            status_runtime_identity("deepseek", "secret-present", String::new(), String::new());
+        assert_eq!(gateway, "");
+        assert_eq!(shim, "");
+        assert_eq!(catalog_shim, "off");
     }
 
     struct EnvGuard {

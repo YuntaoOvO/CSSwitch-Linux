@@ -17,7 +17,7 @@ run_loopback_once() {
   if [ -n "${CSSWITCH_LOOPBACK_TEST_CMD:-}" ]; then
     eval "$CSSWITCH_LOOPBACK_TEST_CMD"
   else
-    python3 -m unittest test.test_proxy_connect test.test_proxy_stream test.test_proxy_dsml_e2e test.test_proxy_auth test.test_proxy_golden -v
+    python3 -m unittest test.test_proxy_connect test.test_proxy_stream test.test_proxy_dsml_e2e test.test_proxy_auth test.test_proxy_golden test.test_gateway_rust -v
   fi
 }
 

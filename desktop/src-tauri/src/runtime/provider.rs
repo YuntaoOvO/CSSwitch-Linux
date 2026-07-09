@@ -117,8 +117,27 @@ pub(crate) fn is_openai_adapter(adapter: &str) -> bool {
     matches!(adapter, "openai-custom" | "openai-responses")
 }
 
-pub(crate) fn gateway_kind_for_adapter(_adapter: &str) -> &'static str {
-    "python"
+pub(crate) fn gateway_kind_for(
+    adapter: &str,
+    shim_mode: &str,
+    gateway_flag: Option<&str>,
+) -> &'static str {
+    let wants_rust = gateway_flag
+        .map(|v| v.trim().eq_ignore_ascii_case("rust"))
+        .unwrap_or(false);
+    if wants_rust && adapter == "deepseek" && shim_mode == "off" {
+        "rust"
+    } else {
+        "python"
+    }
+}
+
+pub(crate) fn gateway_kind_for_adapter(adapter: &str) -> &'static str {
+    gateway_kind_for(
+        adapter,
+        current_shim_mode_for_adapter(adapter),
+        std::env::var("CSSWITCH_GATEWAY").ok().as_deref(),
+    )
 }
 
 pub(crate) fn normalize_shim_mode(adapter: &str, raw: Option<&str>) -> &'static str {
@@ -217,7 +236,7 @@ pub(crate) fn relay_missing_model(adapter: &str, model: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        adapter_for_profile, assert_format_supported, gateway_kind_for_adapter,
+        adapter_for_profile, assert_format_supported, gateway_kind_for, gateway_kind_for_adapter,
         key_env_for_adapter, key_fingerprint, normalize_shim_mode, parse_endpoint, proxy_args_for,
         proxy_fingerprint, proxy_fingerprint_with_runtime, reject_openai_custom_anthropic_base,
         relay_missing_base_url, relay_missing_model, should_scratch_candidate, upstream_endpoint,
@@ -460,6 +479,21 @@ mod tests {
     fn runtime_identity_contract_defaults_to_python_and_deepseek_only_shim() {
         assert_eq!(gateway_kind_for_adapter("deepseek"), "python");
         assert_eq!(gateway_kind_for_adapter("openai-custom"), "python");
+        assert_eq!(gateway_kind_for("deepseek", "off", Some("rust")), "rust");
+        assert_eq!(
+            gateway_kind_for("deepseek", "detect", Some("rust")),
+            "python"
+        );
+        assert_eq!(
+            gateway_kind_for("deepseek", "rewrite", Some("rust")),
+            "python"
+        );
+        assert_eq!(gateway_kind_for("qwen", "off", Some("rust")), "python");
+        assert_eq!(gateway_kind_for("relay", "off", Some("rust")), "python");
+        assert_eq!(
+            gateway_kind_for("deepseek", "off", Some("python")),
+            "python"
+        );
         assert_eq!(normalize_shim_mode("deepseek", Some("detect")), "detect");
         assert_eq!(normalize_shim_mode("deepseek", Some("rewrite")), "rewrite");
         assert_eq!(normalize_shim_mode("deepseek", Some("bad")), "off");

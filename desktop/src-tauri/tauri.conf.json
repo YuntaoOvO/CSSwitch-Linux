@@ -53,6 +53,9 @@
       "../../scripts/stop-science-sandbox.sh": "scripts/stop-science-sandbox.sh",
       "../../scripts/verify-proxy.sh": "scripts/verify-proxy.sh"
     },
+    "externalBin": [
+      "binaries/csswitch-gateway"
+    ],
     "macOS": {
       "signingIdentity": "-"
     }

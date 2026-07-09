@@ -76,6 +76,10 @@ pub(crate) struct AppState {
     pub(crate) secret: String,
     /// 当前代理进程所用 adapter 名（deepseek | qwen | relay | openai-custom | openai-responses）；用于健康复用判定。
     pub(crate) provider: String,
+    /// 当前代理进程的 gateway 实现身份（python | rust）。
+    pub(crate) gateway_kind: String,
+    /// 当前代理进程的 DeepSeek tool-use shim 模式（off | detect | rewrite）。
+    pub(crate) shim_mode: String,
     /// 当前代理进程所用 key 的非加密指纹（仅内存、绝不落盘/打印）。
     /// 换 key/换上游后指纹变化 → 触发重启，避免复用带旧配置的代理。
     pub(crate) key_fp: u64,
@@ -90,6 +94,8 @@ impl AppState {
     pub(crate) fn clear_proxy_identity(&mut self) {
         self.secret.clear();
         self.provider.clear();
+        self.gateway_kind.clear();
+        self.shim_mode.clear();
         self.key_fp = 0;
     }
 
@@ -292,12 +298,16 @@ mod tests {
         let mut st = AppState {
             secret: "secret".into(),
             provider: "deepseek".into(),
+            gateway_kind: "rust".into(),
+            shim_mode: "off".into(),
             key_fp: 42,
             ..AppState::default()
         };
         st.clear_proxy_identity();
         assert!(st.secret.is_empty());
         assert!(st.provider.is_empty());
+        assert!(st.gateway_kind.is_empty());
+        assert!(st.shim_mode.is_empty());
         assert_eq!(st.key_fp, 0);
     }
 
