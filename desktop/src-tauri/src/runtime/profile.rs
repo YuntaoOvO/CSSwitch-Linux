@@ -617,6 +617,42 @@ mod tests {
     }
 
     #[test]
+    fn get_config_redaction_never_projects_full_key_material() {
+        let d = tmpdir_profile();
+        let full_key = "sk-contract-prefix-secret-middle-tail9999";
+        let id =
+            create_profile_inner(&d, "glm", "GLM", Some(full_key), None, Some("glm-5.2")).unwrap();
+        let v = build_get_config(&d).unwrap();
+        let p = v["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == id)
+            .unwrap();
+
+        assert!(
+            p.get("api_key").is_none() || p["api_key"].is_null(),
+            "frontend-safe projection must not expose api_key"
+        );
+        assert_eq!(p["has_key"], true);
+        assert_eq!(
+            p["key"], p["key_masked"],
+            "legacy key remains masked alias only"
+        );
+        assert!(p["key_masked"].as_str().unwrap().ends_with("9999"));
+
+        let projected = serde_json::to_string(p).unwrap();
+        assert!(
+            !projected.contains(full_key),
+            "frontend-safe projection leaked the full key"
+        );
+        assert!(
+            !projected.contains("contract-prefix-secret-middle"),
+            "frontend-safe projection leaked key body material"
+        );
+    }
+
+    #[test]
     fn get_config_returns_notes_so_rename_does_not_wipe_them() {
         // M1 回归：build_get_config 必须回传 notes，否则前端读到空、下次改名把备注静默清掉。
         let d = tmpdir_profile();
@@ -650,6 +686,102 @@ mod tests {
             "openai_models_or_manual"
         );
         assert_eq!(custom["capabilities"]["base_url_required"], true);
+    }
+
+    #[test]
+    fn all_templates_include_the_full_capability_contract_shape() {
+        let templates = build_list_templates();
+        let template_fields = [
+            "id",
+            "name",
+            "category",
+            "api_format",
+            "adapter",
+            "base_url",
+            "base_url_editable",
+            "requires_model_override",
+            "builtin_models",
+            "icon",
+            "icon_color",
+            "website_url",
+            "capabilities",
+        ];
+        let capability_fields = [
+            "base_url_required",
+            "model_required",
+            "model_discovery",
+            "supports_thinking_policy",
+            "thinking_policy",
+            "supports_tools_hint",
+        ];
+        for template in templates {
+            let id = template["id"].as_str().unwrap_or("<missing-id>");
+            for field in template_fields {
+                assert!(
+                    template.get(field).is_some(),
+                    "template {id} missing field {field}"
+                );
+            }
+            assert!(
+                template["builtin_models"].is_array(),
+                "template {id} builtin_models"
+            );
+            assert!(
+                template["base_url_editable"].is_boolean(),
+                "template {id} base_url_editable"
+            );
+            assert!(
+                template["requires_model_override"].is_boolean(),
+                "template {id} requires_model_override"
+            );
+            let capabilities = &template["capabilities"];
+            for field in capability_fields {
+                assert!(
+                    capabilities.get(field).is_some(),
+                    "template {id} missing capability {field}"
+                );
+            }
+            assert!(
+                capabilities["base_url_required"].is_boolean(),
+                "template {id} base_url_required"
+            );
+            assert!(
+                capabilities["model_required"].is_boolean(),
+                "template {id} model_required"
+            );
+            assert!(
+                capabilities["supports_thinking_policy"].is_boolean(),
+                "template {id} supports_thinking_policy"
+            );
+            assert!(
+                matches!(
+                    capabilities["thinking_policy"].as_str(),
+                    Some("" | "adaptive" | "enabled")
+                ),
+                "template {id} thinking_policy"
+            );
+            assert_eq!(
+                capabilities["supports_thinking_policy"].as_bool().unwrap(),
+                !capabilities["thinking_policy"].as_str().unwrap().is_empty(),
+                "template {id} supports_thinking_policy must match thinking_policy"
+            );
+            assert!(
+                matches!(
+                    capabilities["model_discovery"].as_str(),
+                    Some(
+                        "builtin_static" | "anthropic_models_or_manual" | "openai_models_or_manual"
+                    )
+                ),
+                "template {id} model_discovery"
+            );
+            assert!(
+                matches!(
+                    capabilities["supports_tools_hint"].as_str(),
+                    Some("native" | "passthrough" | "translated" | "unknown")
+                ),
+                "template {id} supports_tools_hint"
+            );
+        }
     }
 
     #[test]

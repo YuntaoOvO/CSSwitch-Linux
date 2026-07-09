@@ -75,6 +75,72 @@ fn discovery_adapter(
     }
 }
 
+fn build_fetch_models_contract_response(
+    outcome: &scratch::ProbeOutcome,
+    status: Option<u16>,
+    body: &str,
+    builtin: &[&str],
+) -> Result<Value, String> {
+    match outcome {
+        scratch::ProbeOutcome::Ok => {
+            let v: Value =
+                serde_json::from_str(body).map_err(|e| format!("解析模型列表失败：{e}"))?;
+            let live: Vec<(String, Option<bool>)> = v
+                .get("data")
+                .and_then(|d| d.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|m| {
+                            let id = m.get("id")?.as_str()?.to_string();
+                            let st = m.get("supports_tools").and_then(|b| b.as_bool());
+                            Some((id, st))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if live.is_empty() {
+                return Ok(json!({
+                    "models": merge_and_sort_models(vec![], builtin),
+                    "source": "builtin", "error_kind": null, "upstream_status": 200
+                }));
+            }
+            Ok(json!({
+                "models": merge_and_sort_models(live, builtin),
+                "source": "live", "error_kind": null, "upstream_status": 200
+            }))
+        }
+        scratch::ProbeOutcome::Auth(code) => {
+            Err(format!("上游拒绝（{code}），key 或权限可能有误。"))
+        }
+        other => {
+            let source = scratch::discovery_fallback_source(other);
+            let error_kind = if source == "network" {
+                json!("network")
+            } else {
+                json!(null)
+            };
+            Ok(json!({
+                "models": merge_and_sort_models(vec![], builtin),
+                "source": source,
+                "error_kind": error_kind,
+                "upstream_status": status
+            }))
+        }
+    }
+}
+
+fn live_model_count_from_body(body: &str) -> Result<usize, String> {
+    let v: Value = serde_json::from_str(body).map_err(|e| format!("解析模型列表失败：{e}"))?;
+    Ok(v.get("data")
+        .and_then(|d| d.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter(|m| m.get("id").and_then(|id| id.as_str()).is_some())
+                .count()
+        })
+        .unwrap_or(0))
+}
+
 /// 「获取可用模型」——纯 scratch 探测：只用临时代理探候选 base_url/key 的 /v1/models，
 /// 绝不写 config、不改 AppState、不碰正在服务 Science 的正式代理。
 pub(crate) fn fetch_models(
@@ -128,57 +194,30 @@ pub(crate) fn fetch_models(
         Some(&trace),
     );
     let builtin = tpl.builtin_models;
-    match scratch::classify(res.status) {
+    let outcome = scratch::classify(res.status);
+    match &outcome {
         scratch::ProbeOutcome::Ok => {
             trace.stage(OperationStage::ScratchUpstreamProbe, "outcome=ok");
-            let v: Value =
-                serde_json::from_str(&res.body).map_err(|e| format!("解析模型列表失败：{e}"))?;
-            let live: Vec<(String, Option<bool>)> = v
-                .get("data")
-                .and_then(|d| d.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|m| {
-                            let id = m.get("id")?.as_str()?.to_string();
-                            let st = m.get("supports_tools").and_then(|b| b.as_bool());
-                            Some((id, st))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            if live.is_empty() {
+            let live_count = live_model_count_from_body(&res.body)?;
+            let response =
+                build_fetch_models_contract_response(&outcome, res.status, &res.body, builtin)?;
+            if live_count == 0 {
                 trace.finish("ok source=builtin empty_live");
-                return Ok(json!({
-                    "models": merge_and_sort_models(vec![], builtin),
-                    "source": "builtin", "error_kind": null, "upstream_status": 200
-                }));
+            } else {
+                trace.finish(format!("ok source=live count={live_count}"));
             }
-            trace.finish(format!("ok source=live count={}", live.len()));
-            Ok(json!({
-                "models": merge_and_sort_models(live, builtin),
-                "source": "live", "error_kind": null, "upstream_status": 200
-            }))
+            Ok(response)
         }
         scratch::ProbeOutcome::Auth(code) => {
             trace.finish(format!("rejected status={code}"));
-            Err(format!("上游拒绝（{code}），key 或权限可能有误。"))
+            build_fetch_models_contract_response(&outcome, res.status, &res.body, builtin)
         }
         // 非 200 且非 Auth：一律 builtin 兜底，但按语义分「发现不支持」(4xx) 与「网络/上游临时」(5xx/429/无响应)，
         // 供前端区分提示（spec v3 §3.4.3）。绝不把 Auth 混进来掩盖坏 key。
         other => {
-            let source = scratch::discovery_fallback_source(&other);
+            let source = scratch::discovery_fallback_source(other);
             trace.finish(format!("fallback source={source} outcome={other:?}"));
-            let error_kind = if source == "network" {
-                json!("network")
-            } else {
-                json!(null)
-            };
-            Ok(json!({
-                "models": merge_and_sort_models(vec![], builtin),
-                "source": source,
-                "error_kind": error_kind,
-                "upstream_status": res.status
-            }))
+            build_fetch_models_contract_response(&outcome, res.status, &res.body, builtin)
         }
     }
 }
@@ -186,10 +225,10 @@ pub(crate) fn fetch_models(
 #[cfg(test)]
 mod tests {
     use super::{
-        discovery_adapter, effective_api_format_from_dir, resolve_probe_key,
-        resolve_probe_key_from_dir,
+        build_fetch_models_contract_response, discovery_adapter, effective_api_format_from_dir,
+        resolve_probe_key, resolve_probe_key_from_dir,
     };
-    use crate::{config, runtime::profile::create_profile_inner};
+    use crate::{config, runtime::profile::create_profile_inner, scratch::ProbeOutcome};
 
     fn tmpdir_model_discovery() -> std::path::PathBuf {
         let base = std::env::temp_dir().join(format!(
@@ -265,5 +304,67 @@ mod tests {
             effective_api_format_from_dir(&d, tpl, None, None).unwrap(),
             "anthropic"
         );
+    }
+
+    #[test]
+    fn fetch_models_contract_maps_live_and_empty_live_to_frozen_shape() {
+        let live = build_fetch_models_contract_response(
+            &ProbeOutcome::Ok,
+            Some(200),
+            r#"{"data":[{"id":"m-live","supports_tools":true}]}"#,
+            &["m-builtin"],
+        )
+        .unwrap();
+        assert_eq!(live["source"], "live");
+        assert_eq!(live["error_kind"], serde_json::Value::Null);
+        assert_eq!(live["upstream_status"], 200);
+        assert_eq!(live["models"][0]["id"], "m-live");
+        assert_eq!(live["models"][0]["supports_tools"], true);
+
+        let empty_live = build_fetch_models_contract_response(
+            &ProbeOutcome::Ok,
+            Some(200),
+            r#"{"data":[]}"#,
+            &["m-builtin"],
+        )
+        .unwrap();
+        assert_eq!(empty_live["source"], "builtin");
+        assert_eq!(empty_live["error_kind"], serde_json::Value::Null);
+        assert_eq!(empty_live["upstream_status"], 200);
+        assert_eq!(empty_live["models"][0]["id"], "m-builtin");
+    }
+
+    #[test]
+    fn fetch_models_contract_keeps_auth_hard_and_soft_fallbacks_typed() {
+        let auth = build_fetch_models_contract_response(
+            &ProbeOutcome::Auth(401),
+            Some(401),
+            "",
+            &["m-builtin"],
+        );
+        assert!(auth.unwrap_err().contains("401"));
+
+        let unsupported = build_fetch_models_contract_response(
+            &ProbeOutcome::Unsupported(405),
+            Some(405),
+            "",
+            &["m-builtin"],
+        )
+        .unwrap();
+        assert_eq!(unsupported["source"], "unsupported");
+        assert_eq!(unsupported["error_kind"], serde_json::Value::Null);
+        assert_eq!(unsupported["upstream_status"], 405);
+        assert_eq!(unsupported["models"][0]["id"], "m-builtin");
+
+        let network = build_fetch_models_contract_response(
+            &ProbeOutcome::NoResponse,
+            None,
+            "",
+            &["m-builtin"],
+        )
+        .unwrap();
+        assert_eq!(network["source"], "network");
+        assert_eq!(network["error_kind"], "network");
+        assert!(network["upstream_status"].is_null());
     }
 }
