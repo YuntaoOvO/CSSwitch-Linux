@@ -11,3 +11,4 @@ pub(crate) mod inspection;
 pub(crate) mod model;
 pub(crate) mod requirements;
 pub(crate) mod store;
+pub(crate) mod workspace_ingress;

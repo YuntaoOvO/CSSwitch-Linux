@@ -4,7 +4,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License">
-  <a href="https://github.com/SuperJJ007/CSSwitch/releases/tag/v0.4.2"><img src="https://img.shields.io/badge/release-v0.4.2-2ea44f.svg" alt="CSSwitch v0.4.2"></a>
+  <a href="https://github.com/SuperJJ007/CSSwitch/releases/tag/v0.4.3"><img src="https://img.shields.io/badge/release-v0.4.3-2ea44f.svg" alt="CSSwitch v0.4.3"></a>
   <img src="https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-1d1d1f.svg" alt="macOS Apple Silicon">
   <img src="https://img.shields.io/badge/built%20with-Tauri%202-C25A34.svg" alt="Tauri 2">
 </p>
@@ -16,7 +16,7 @@
 
 # CSSwitch
 
-CSSwitch 是一个给 Claude Science 使用的本地模型切换器。它把 Science 的推理请求接到你自己的第三方模型 API 上，让没有 Claude 订阅的用户也能在 Science 里使用 DeepSeek、通义千问、Kimi、MiniMax、GLM、OpenRouter、中转站或自定义兼容端点。
+CSSwitch 是一个给 Claude Science 使用的本地配置转换器。它把 Science 的推理请求转换并接入你自己的模型 API，可配置 DeepSeek、通义千问、Kimi、MiniMax、GLM、OpenRouter、中转站或自定义兼容端点。
 
 它面向的不只是开发者：你只需要准备 Claude Science、一个第三方 API Key，然后在桌面面板里新建配置、设为当前、点击「一键开始」。
 
@@ -24,7 +24,7 @@ CSSwitch 是一个给 Claude Science 使用的本地模型切换器。它把 Sci
 
 [下载最新版](../../releases/latest) · [更新日志](./CHANGELOG.md) · [报告问题](https://github.com/SuperJJ007/CSSwitch/issues/new?template=bug_report.yml) · [功能建议](https://github.com/SuperJJ007/CSSwitch/issues/new?template=feature_request.yml)
 
-> **0.4.2 升级提示：** 新增 Skill Manager：从明确配置的来源扫描科研 Skill，导入 CSSwitch 管理的 store，再部署到隔离 Science；来源消失不会删除已导入副本。0.4.1 的旧 Python proxy 精确身份清理完整保留，未知 listener 仍拒绝处理。见 [升级与回滚说明](./docs/upgrade-and-rollback.md)。
+> **0.4.3 升级提示：** Science agent 可在当前 workspace 根目录生成 `<名称>.skill.md`；再次点击一键开始后，CSSwitch 会自动接管、持久化、部署并重启隔离 Science。Skill store 冲突会无损隔离并尝试恢复有效 Skill。见 [升级与回滚说明](./docs/upgrade-and-rollback.md)。
 
 ## 目录
 
@@ -50,7 +50,7 @@ CSSwitch 做的是本地运行控制：
 - 在独立的本地工作区中运行第三方模型模式，不接管你的真实 Claude 账号。
 - 把 Science 的模型请求转发到你选择的第三方 provider。
 - 在需要时把 Anthropic Messages API 和 OpenAI 兼容接口互相转换。
-- 保留「官方 Claude」模式，让有订阅的用户可以随时回到真实 Science。
+- 保留「官方 Claude」模式，可随时切回 Science 的官方服务配置。
 
 简单理解：CSSwitch 之于 Claude Science，类似 CC Switch 之于 Claude Code，并额外管理桌面应用、隔离工作区与本地网关。
 
@@ -98,11 +98,11 @@ Claude Science sandbox
 7. 验证通过后点击「一键开始」。
 8. CSSwitch 会启动隔离 Science，并在浏览器中打开入口。
 
-如果你有 Claude 订阅，只想正常使用官方 Claude Science，切到「官方 Claude」模式即可。CSSwitch 会停止第三方代理链路，再打开真实 Science。
+如果你想使用 Science 的官方服务配置，切到「官方 Claude」模式即可。CSSwitch 会停止第三方代理链路，再打开真实 Science。
 
 ## 从旧版升级
 
-0.4.2 保留现有 v2 配置格式。退出旧版 CSSwitch 后，将 0.4.2 拖入「应用程序」并覆盖即可；首次启动仍可能需要右键选择「打开」。升级前建议备份整个 `~/.csswitch/`，其中包含配置和已导入 Skill。回滚只替换 app，不会自动删除新数据；旧版本会忽略它无法识别的 Skill Manager 数据。
+0.4.3 保留现有 v2 配置格式。退出旧版 CSSwitch 后，将 0.4.3 拖入「应用程序」并覆盖即可；首次启动仍可能需要右键选择「打开」。升级前建议备份整个 `~/.csswitch/`，其中包含配置和已导入 Skill。回滚只替换 app，不会自动删除新数据；旧版本会忽略它无法识别的 Skill Manager 数据。
 
 完整步骤、备份位置和回滚边界见 [升级与回滚说明](./docs/upgrade-and-rollback.md)。
 

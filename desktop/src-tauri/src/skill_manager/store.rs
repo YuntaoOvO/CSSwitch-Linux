@@ -3,6 +3,7 @@ use std::ffi::{CStr, CString, OsStr};
 use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{Read, Write};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, TryLockError};
@@ -130,6 +131,13 @@ pub(crate) struct UninstallOutcome {
     pub(crate) store_gc_pending: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StoreRecoveryReport {
+    pub(crate) quarantine_path: PathBuf,
+    pub(crate) recovered: usize,
+    pub(crate) skipped: usize,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct OwnedStoreUsage {
     versions: usize,
@@ -181,6 +189,64 @@ impl SkillManager {
 
     pub(crate) fn inspect(&self, source: &Path) -> SkillResult<InspectionResult> {
         inspect_skill_source(source)
+    }
+
+    /// Moves a conflicting owned Skill root aside and salvages every payload still accepted by
+    /// the normal inspector. Nothing in the quarantine is deleted.
+    pub(crate) fn quarantine_and_restore_store(&self) -> SkillResult<StoreRecoveryReport> {
+        let (old_inventory, quarantine_path) = {
+            let _guard = acquire_write_lock()?;
+            assert_path_chain_no_symlink(&self.config_dir)?;
+            let metadata = fs::symlink_metadata(&self.paths.root).map_err(|_| store_conflict())?;
+            if !metadata.is_dir()
+                || metadata.file_type().is_symlink()
+                || metadata.uid() != unsafe { libc::geteuid() }
+            {
+                return Err(store_conflict());
+            }
+            let old_inventory = fs::read(&self.paths.inventory)
+                .ok()
+                .filter(|bytes| bytes.len() as u64 <= MAX_INVENTORY_SIZE)
+                .and_then(|bytes| serde_json::from_slice::<Inventory>(&bytes).ok())
+                .unwrap_or_default();
+            let quarantine_path = self.config_dir.join(format!(
+                "skills.quarantine.{}.{}",
+                now_ms(),
+                std::process::id()
+            ));
+            if quarantine_path.exists() {
+                return Err(store_conflict());
+            }
+            fs::rename(&self.paths.root, &quarantine_path).map_err(|_| atomic_error())?;
+            (old_inventory, quarantine_path)
+        };
+
+        let mut recovered = 0_usize;
+        let mut skipped = 0_usize;
+        for old in old_inventory.skills {
+            let payload = quarantine_path
+                .join("store")
+                .join(old.skill_id.as_str())
+                .join(&old.content_hash)
+                .join("payload");
+            let restored = (|| {
+                let outcome = self.import_source(&payload)?;
+                if old.enabled {
+                    self.set_enabled(&outcome.skill.skill_id, true)?;
+                }
+                Ok::<(), SkillManagerError>(())
+            })();
+            if restored.is_ok() {
+                recovered += 1;
+            } else {
+                skipped += 1;
+            }
+        }
+        Ok(StoreRecoveryReport {
+            quarantine_path,
+            recovered,
+            skipped,
+        })
     }
 
     pub(crate) fn verify_skill_store(&self, skill: &InstalledSkill) -> SkillResult<()> {
@@ -2031,6 +2097,18 @@ impl SafeDir {
         Ok(())
     }
 
+    pub(super) fn validate_external_owned(&self) -> SkillResult<()> {
+        let stat = file_stat(&self.file)?;
+        let mode = stat.st_mode & 0o777;
+        if stat.st_mode & libc::S_IFMT != libc::S_IFDIR
+            || stat.st_uid != current_euid()
+            || mode & 0o022 != 0
+        {
+            return Err(store_conflict());
+        }
+        Ok(())
+    }
+
     pub(super) fn open_child(&self, name: &std::ffi::OsStr) -> SkillResult<Self> {
         let name = os_cstring(name)?;
         let before = self.child_stat(&name)?.ok_or_else(store_conflict)?;
@@ -2140,6 +2218,53 @@ impl SafeDir {
                 inode: before.st_ino as u64,
             },
         ))
+    }
+
+    pub(super) fn read_bound_external_file(
+        &self,
+        name: &std::ffi::OsStr,
+        max_size: u64,
+    ) -> SkillResult<Vec<u8>> {
+        let name = os_cstring(name)?;
+        let expected = self.child_stat(&name)?.ok_or_else(store_conflict)?;
+        let mode = expected.st_mode & 0o777;
+        if expected.st_mode & libc::S_IFMT != libc::S_IFREG
+            || expected.st_nlink != 1
+            || expected.st_size < 0
+            || expected.st_size as u64 > max_size
+            || expected.st_uid != current_euid()
+            || mode & 0o400 == 0
+            || mode & 0o022 != 0
+        {
+            return Err(store_conflict());
+        }
+        // SAFETY: the directory fd is anchored; O_NOFOLLOW rejects a leaf symlink.
+        let fd = unsafe {
+            libc::openat(
+                self.file.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if fd < 0 {
+            return Err(store_conflict());
+        }
+        // SAFETY: fd is newly owned by this File.
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        let opened = file_stat(&file)?;
+        if !same_file_snapshot(&expected, &opened) {
+            return Err(store_conflict());
+        }
+        let mut data = Vec::with_capacity(usize::try_from(opened.st_size).unwrap_or(0));
+        std::io::Read::by_ref(&mut file)
+            .take(max_size + 1)
+            .read_to_end(&mut data)
+            .map_err(|_| store_conflict())?;
+        let after = file_stat(&file)?;
+        if data.len() as i64 != opened.st_size || !same_file_snapshot(&opened, &after) {
+            return Err(store_conflict());
+        }
+        Ok(data)
     }
 
     pub(super) fn verify_file_identity(
@@ -4241,5 +4366,40 @@ mod tests {
             SkillErrorCode::StoreConflict
         );
         assert_eq!(fs::read(target).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn conflicting_store_is_quarantined_and_valid_payload_is_restored() {
+        let _serial = TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let root = TestDir::new("store-recovery");
+        let source = TestDir::skill("Recovery Probe", "1.0.0", "recover me");
+        let manager = SkillManager::new(root.0.join(".csswitch"));
+        let skill = manager.import_source(&source.0).unwrap().skill;
+        manager.set_enabled(&skill.skill_id, true).unwrap();
+        fs::write(
+            manager
+                .paths
+                .store
+                .join(skill.skill_id.as_str())
+                .join(&skill.content_hash)
+                .join(STORE_MARKER_FILE),
+            b"corrupt",
+        )
+        .unwrap();
+        assert_eq!(
+            manager.verify_skill_store(&skill).unwrap_err().code,
+            SkillErrorCode::StoreConflict
+        );
+
+        let recovery = manager.quarantine_and_restore_store().unwrap();
+        assert_eq!(recovery.recovered, 1);
+        assert_eq!(recovery.skipped, 0);
+        assert!(recovery.quarantine_path.is_dir());
+        let restored = manager.load_inventory().unwrap();
+        assert_eq!(restored.skills.len(), 1);
+        assert!(restored.skills[0].enabled);
+        manager.verify_skill_store(&restored.skills[0]).unwrap();
     }
 }

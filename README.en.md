@@ -4,7 +4,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License">
-  <a href="https://github.com/SuperJJ007/CSSwitch/releases/tag/v0.4.2"><img src="https://img.shields.io/badge/release-v0.4.2-2ea44f.svg" alt="CSSwitch v0.4.2"></a>
+  <a href="https://github.com/SuperJJ007/CSSwitch/releases/tag/v0.4.3"><img src="https://img.shields.io/badge/release-v0.4.3-2ea44f.svg" alt="CSSwitch v0.4.3"></a>
   <img src="https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-1d1d1f.svg" alt="macOS Apple Silicon">
   <img src="https://img.shields.io/badge/built%20with-Tauri%202-C25A34.svg" alt="Tauri 2">
 </p>
@@ -16,7 +16,7 @@
 
 # CSSwitch
 
-CSSwitch is a local model switcher for Claude Science. It routes Science inference requests to your own third-party model API, so you can use DeepSeek, Qwen, Kimi, MiniMax, GLM, OpenRouter, relay providers, or custom compatible endpoints inside Science without a Claude subscription.
+CSSwitch is a local configuration converter for Claude Science. It translates Science inference requests and connects them to your own model API, including DeepSeek, Qwen, Kimi, MiniMax, GLM, OpenRouter, relay providers, or custom compatible endpoints.
 
 It is built for more than developers. You need Claude Science, a third-party API key, and the CSSwitch desktop panel: create a profile, make it active, then click "一键开始" (Start).
 
@@ -24,7 +24,7 @@ It is built for more than developers. You need Claude Science, a third-party API
 
 [Download latest release](../../releases/latest) · [Changelog](./CHANGELOG.md) · [Report a bug](https://github.com/SuperJJ007/CSSwitch/issues/new?template=bug_report.yml) · [Request a feature](https://github.com/SuperJJ007/CSSwitch/issues/new?template=feature_request.yml)
 
-> **0.4.2 upgrade note:** The new Skill Manager scans configured research-Skill sources, imports managed copies, and deploys them into isolated Science. Imported copies survive source removal. The exact legacy Python-proxy cleanup from 0.4.1 remains intact, and unknown listeners still fail closed. See [Upgrade and rollback](./docs/upgrade-and-rollback.md).
+> **0.4.3 upgrade note:** A Science agent can create `<name>.skill.md` in the current workspace root. On the next one-click start, CSSwitch takes it over, persists and deploys it, then automatically restarts isolated Science. Store conflicts are quarantined without deletion and valid Skills are restored when possible. See [Upgrade and rollback](./docs/upgrade-and-rollback.md).
 
 ## Contents
 
@@ -98,11 +98,11 @@ Before starting, make sure you have:
 7. After verification succeeds, click "一键开始" (Start).
 8. CSSwitch starts the isolated Science instance and opens it in your browser.
 
-If you have a Claude subscription and want the normal official Science experience, switch to "官方 Claude" (Official Claude). CSSwitch will tear down the third-party proxy path and open the real Science app.
+To use Science with its official service configuration, switch to "官方 Claude" (Official Claude). CSSwitch will tear down the third-party proxy path and open the real Science app.
 
 ## Upgrading from an older version
 
-CSSwitch 0.4.2 keeps the existing v2 configuration format. Quit the older app, drag 0.4.2 into Applications, and replace the existing copy. Back up all of `~/.csswitch/` first because it now includes configuration and imported Skills. Rolling back replaces only the app and does not remove new data; older releases ignore Skill Manager data they do not understand.
+CSSwitch 0.4.3 keeps the existing v2 configuration format. Quit the older app, drag 0.4.3 into Applications, and replace the existing copy. Back up all of `~/.csswitch/` first because it includes configuration and imported Skills. Rolling back replaces only the app and does not remove new data; older releases ignore Skill Manager data they do not understand.
 
 For exact steps, backup locations, and rollback boundaries, see [Upgrade and rollback](./docs/upgrade-and-rollback.md).
 

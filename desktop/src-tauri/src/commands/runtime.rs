@@ -471,6 +471,7 @@ mod tests {
     };
     use sha2::{Digest, Sha256};
     use std::{
+        collections::BTreeMap,
         env,
         ffi::OsStr,
         fs,
@@ -786,6 +787,8 @@ esac
     #[derive(Clone, Debug, Default, Eq, PartialEq)]
     struct SkillMockObservation {
         main_count: usize,
+        available_tools: Vec<String>,
+        probe_tool_schemas: BTreeMap<String, serde_json::Value>,
         skill_schema_fields: Vec<String>,
         tool_order: Vec<String>,
         tool_input_matches_runtime: Option<bool>,
@@ -849,6 +852,32 @@ esac
             return kind;
         }
         observation.main_count += 1;
+        if observation.available_tools.is_empty() {
+            observation.probe_tool_schemas = value
+                .get("tools")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|tool| {
+                    let name = tool.get("name")?.as_str()?;
+                    if !matches!(name, "bash" | "edit_file" | "save_artifacts") {
+                        return None;
+                    }
+                    Some((name.to_string(), tool.get("input_schema")?.clone()))
+                })
+                .collect();
+            let mut tools = value
+                .get("tools")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|tool| tool.get("name").and_then(serde_json::Value::as_str))
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            tools.sort();
+            tools.dedup();
+            observation.available_tools = tools;
+        }
         if observation.skill_schema_fields.is_empty() {
             let mut fields = value
                 .get("tools")
@@ -962,6 +991,34 @@ esac
         .into_bytes()
     }
 
+    fn anthropic_edit_file_probe_sse(file_path: &str) -> Vec<u8> {
+        let input = serde_json::json!({
+            "human_description": "Writing Skill probe",
+            "file_path": file_path,
+            "old_string": "",
+            "new_string": "---\nname: csswitch-agent-skill-probe\ndescription: Isolated agent workspace write probe\n---\nReturn CSSWITCH_AGENT_WRITE_PROBE.\n"
+        });
+        let partial_json = serde_json::to_string(&input).unwrap();
+        let delta = serde_json::to_string(&serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": partial_json}
+        }))
+        .unwrap();
+        format!(
+            concat!(
+                "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_csswitch_edit\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"csswitch-local-mock\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}}}\n\n",
+                "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"toolu_csswitch_edit\",\"name\":\"edit_file\",\"input\":{{}}}}}}\n\n",
+                "event: content_block_delta\ndata: {delta}\n\n",
+                "event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n",
+                "event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\",\"stop_sequence\":null}},\"usage\":{{\"output_tokens\":1}}}}\n\n",
+                "event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+            ),
+            delta = delta
+        )
+        .into_bytes()
+    }
+
     struct SkillMockServer {
         port: u16,
         observation: Arc<Mutex<SkillMockObservation>>,
@@ -970,7 +1027,7 @@ esac
     }
 
     impl SkillMockServer {
-        fn start(runtime_name: String, marker: String) -> Self {
+        fn start(runtime_name: String, marker: String, write_probe_target: Option<String>) -> Self {
             use std::sync::atomic::Ordering;
 
             let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -981,6 +1038,7 @@ esac
             let thread_observation = observation.clone();
             let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let thread_shutdown = shutdown.clone();
+            let write_probe = write_probe_target.is_some();
             let server_thread = thread::spawn(move || {
                 while !thread_shutdown.load(Ordering::Acquire) {
                     match listener.accept() {
@@ -1009,10 +1067,20 @@ esac
                                         let mut locked = thread_observation
                                             .lock()
                                             .unwrap_or_else(|error| error.into_inner());
-                                        locked.tool_order.push("response:skill".to_string());
+                                        locked.tool_order.push(if write_probe {
+                                            "response:edit_file".to_string()
+                                        } else {
+                                            "response:skill".to_string()
+                                        });
                                         (
                                             "text/event-stream",
-                                            anthropic_skill_tool_sse(&runtime_name),
+                                            if write_probe {
+                                                anthropic_edit_file_probe_sse(
+                                                    write_probe_target.as_deref().unwrap(),
+                                                )
+                                            } else {
+                                                anthropic_skill_tool_sse(&runtime_name)
+                                            },
                                         )
                                     }
                                     SkillMockRequestKind::MainToolResult => {
@@ -1440,10 +1508,12 @@ esac
             .open(spec.stderr_path)
             .unwrap();
         let mut command = safe_e2e_command(spec.science_bin, spec.sandbox_home, spec.safe_bin);
+        command.arg("serve").arg("--data-dir").arg(spec.data_dir);
+        let explicit_config = spec.data_dir.join("config.toml");
+        if explicit_config.is_file() {
+            command.arg("--config").arg(&explicit_config);
+        }
         command
-            .arg("serve")
-            .arg("--data-dir")
-            .arg(spec.data_dir)
             .arg("--port")
             .arg(spec.port.to_string())
             .arg("--sandbox-port")
@@ -1451,10 +1521,16 @@ esac
             .arg("--no-browser")
             .arg("--no-auto-update")
             .env("ANTHROPIC_BASE_URL", spec.anthropic_base_url)
-            .env("http_proxy", "http://127.0.0.1:9")
-            .env("HTTP_PROXY", "http://127.0.0.1:9")
-            .env("https_proxy", "http://127.0.0.1:9")
-            .env("HTTPS_PROXY", "http://127.0.0.1:9")
+            .env("OPERON_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+            .env("OPERON_DISABLE_MARKETPLACE_PLUGINS", "1");
+        if env::var("CSSWITCH_AGENT_TOOL_PROBE_NETWORK").as_deref() != Ok("1") {
+            command
+                .env("http_proxy", "http://127.0.0.1:9")
+                .env("HTTP_PROXY", "http://127.0.0.1:9")
+                .env("https_proxy", "http://127.0.0.1:9")
+                .env("HTTPS_PROXY", "http://127.0.0.1:9");
+        }
+        command
             .env("no_proxy", "127.0.0.1,localhost,::1")
             .env("NO_PROXY", "127.0.0.1,localhost,::1")
             .stdout(Stdio::from(stdout))
@@ -1766,9 +1842,17 @@ esac
         };
         let output = command_output_with_timeout(&mut command, timeout)?;
         if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let safe_tail = stderr
+                .chars()
+                .filter(|character| !character.is_control() || *character == '\n')
+                .collect::<String>();
+            let safe_tail = safe_tail.chars().rev().take(600).collect::<String>();
+            let safe_tail = safe_tail.chars().rev().collect::<String>();
             return Err(format!(
-                "Playwright CLI 步骤失败（exit={:?}）",
-                output.status.code()
+                "Playwright CLI 步骤失败（exit={:?}）：{}",
+                output.status.code(),
+                safe_tail
             ));
         }
         String::from_utf8(output.stdout).map_err(|_| "Playwright 输出不是 UTF-8".to_string())
@@ -2051,11 +2135,23 @@ esac
             &home_snapshot,
             "button \"Open project Example project\"",
         )?;
-        let project_snapshot =
-            wait_snapshot_for_control(guard, "button \"New\"", 25, Duration::from_secs(8))?;
-        if project_snapshot.contains("button \"New\"") {
-            playwright_click(guard, &project_snapshot, "button \"New\"")?;
+        let mut project_snapshot = String::new();
+        for _ in 0..25 {
+            project_snapshot = playwright_snapshot(guard)?;
+            if project_snapshot.contains("button \"New\"")
+                || project_snapshot.contains("textbox \"Ask anything")
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(320));
         }
+        if project_snapshot.contains("textbox \"Ask anything") {
+            return Ok(project_snapshot);
+        }
+        if !project_snapshot.contains("button \"New\"") {
+            return Err("隔离 UI 未出现 New 或聊天输入框".to_string());
+        }
+        playwright_click(guard, &project_snapshot, "button \"New\"")?;
         wait_snapshot_for_control(guard, "textbox \"Ask anything", 30, Duration::from_secs(10))
     }
 
@@ -2614,8 +2710,12 @@ esac
         let manager = SkillManager::new(config_dir);
         let installed = manager.import_source(&source).unwrap().skill;
         e2e_enable_skill_with_exact_compatibility_ack(&manager, &installed, &version, &data_dir);
-        oauth_forge::ensure_virtual_login(&data_dir, "virtual@localhost.invalid", &sandbox_home)
-            .unwrap();
+        let (forged, _) = oauth_forge::ensure_virtual_login(
+            &data_dir,
+            "virtual@localhost.invalid",
+            &sandbox_home,
+        )
+        .unwrap();
         let deployed =
             e2e_compatibility_reconcile(&manager, &data_dir, &version, "real_trigger_enabled");
         assert!(deployed.errors.is_empty());
@@ -2631,7 +2731,16 @@ esac
             });
         assert!(science_bin.is_file());
         assert!(playwright_cli.is_file());
-        let mock = SkillMockServer::start(installed.runtime_name.clone(), MARKER.to_string());
+        let write_probe_target = if env::var("CSSWITCH_AGENT_WRITE_PROBE").as_deref() == Ok("1") {
+            Some("csswitch-agent-skill-probe.skill.md".to_string())
+        } else {
+            None
+        };
+        let mock = SkillMockServer::start(
+            installed.runtime_name.clone(),
+            MARKER.to_string(),
+            write_probe_target.clone(),
+        );
         let port = free_port();
         let sandbox_port = free_port();
         assert_ne!(port, sandbox_port);
@@ -2656,7 +2765,11 @@ esac
             data_dir: data_dir.clone(),
             child: Some(child),
             playwright_cli,
-            playwright_session: format!("csswitch-trigger-{}", installed.skill_id.short()),
+            playwright_session: format!(
+                "csswitch-trigger-{}-{}",
+                installed.skill_id.short(),
+                std::process::id()
+            ),
             playwright_cache: env::var_os("CSSWITCH_E2E_NPM_CACHE")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| tmp.join("npm-cache")),
@@ -2671,6 +2784,120 @@ esac
             &tmp.join("science-enabled.stderr.log"),
         );
         manager.mark_science_started(&data_dir).unwrap();
+
+        if env::var("CSSWITCH_AGENT_TOOL_PROBE").as_deref() == Ok("1") {
+            let chat_snapshot = open_science_example_chat(&mut guard).unwrap();
+            send_science_chat_prompt(
+                &guard,
+                &chat_snapshot,
+                "Run the isolated CSSwitch agent tool capability probe now.",
+            )
+            .unwrap();
+            let observed = wait_for_skill_mock_round(&mock);
+            eprintln!("CSSWITCH_REAL_AGENT_TOOLS={:?}", observed.available_tools);
+            eprintln!(
+                "CSSWITCH_REAL_AGENT_TOOL_SCHEMAS={}",
+                serde_json::to_string(&observed.probe_tool_schemas).unwrap()
+            );
+            if env::var("CSSWITCH_AGENT_WRITE_PROBE").as_deref() == Ok("1") {
+                eprintln!(
+                    "CSSWITCH_REAL_AGENT_WRITE_TOOL_RESULT_PRESENT={} error={:?}",
+                    observed.tool_result_count > 0,
+                    observed.tool_result_is_error
+                );
+                let mut pending = vec![tmp.clone()];
+                let mut matches = Vec::new();
+                while let Some(directory) = pending.pop() {
+                    for entry in fs::read_dir(&directory).unwrap() {
+                        let entry = entry.unwrap();
+                        let metadata = fs::symlink_metadata(entry.path()).unwrap();
+                        if metadata.file_type().is_symlink() {
+                            continue;
+                        }
+                        if metadata.is_dir() {
+                            pending.push(entry.path());
+                        } else if entry.file_name() == "csswitch-agent-skill-probe.skill.md" {
+                            matches.push(entry.path());
+                        }
+                    }
+                }
+                assert_eq!(matches.len(), 1, "agent write probe must create one file");
+                let written = &matches[0];
+                assert!(written.ends_with("csswitch-agent-skill-probe.skill.md"));
+                let metadata = fs::symlink_metadata(written).unwrap();
+                assert!(metadata.file_type().is_file());
+                let content = fs::read_to_string(written).unwrap();
+                assert!(content.contains("name: csswitch-agent-skill-probe"));
+                assert!(content.contains("CSSWITCH_AGENT_WRITE_PROBE"));
+                eprintln!(
+                    "CSSWITCH_REAL_AGENT_WRITE={{\"under_data_dir\":{},\"mode\":{:o},\"size\":{}}}",
+                    written.starts_with(&data_dir),
+                    metadata.permissions().mode() & 0o777,
+                    metadata.len()
+                );
+                let ingress = crate::skill_manager::workspace_ingress::scan_workspace_skill_files(
+                    &manager, &data_dir,
+                )
+                .unwrap();
+                assert_eq!(ingress.discovered, 1, "{ingress:?}");
+                assert_eq!(ingress.imported, 1, "{ingress:?}");
+                assert!(ingress.diagnostics.is_empty(), "{ingress:?}");
+                let imported = manager
+                    .load_inventory()
+                    .unwrap()
+                    .skills
+                    .into_iter()
+                    .find(|skill| skill.manifest.name == "csswitch-agent-skill-probe")
+                    .unwrap();
+                manager.verify_skill_store(&imported).unwrap();
+                eprintln!("CSSWITCH_REAL_AGENT_WRITE_STORE_IMPORT=PASS");
+            }
+            guard.stop();
+            wait_http_unreachable(port);
+            wait_http_unreachable(sandbox_port);
+            if let Some(written) = write_probe_target.as_deref() {
+                let installed = manager
+                    .load_inventory()
+                    .unwrap()
+                    .skills
+                    .into_iter()
+                    .find(|skill| skill.manifest.name == "csswitch-agent-skill-probe")
+                    .unwrap();
+                fs::remove_dir_all(&data_dir).unwrap();
+                assert!(!Path::new(written).is_absolute());
+                fs::create_dir_all(&data_dir).unwrap();
+                fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o700)).unwrap();
+                let active_org = data_dir.join("active-org.json");
+                fs::write(
+                    &active_org,
+                    serde_json::to_vec(&serde_json::json!({"org_uuid": forged.org_uuid})).unwrap(),
+                )
+                .unwrap();
+                fs::set_permissions(&active_org, fs::Permissions::from_mode(0o600)).unwrap();
+                let rebuilt = manager
+                    .reconcile(&data_dir, false, "agent_workspace_rebuild")
+                    .unwrap();
+                assert!(rebuilt.errors.is_empty());
+                assert!(rebuilt
+                    .applied
+                    .iter()
+                    .any(|item| item.skill_id == installed.skill_id));
+                assert!(data_dir
+                    .join("orgs")
+                    .join(&forged.org_uuid)
+                    .join("skills")
+                    .join(&installed.runtime_name)
+                    .join("SKILL.md")
+                    .is_file());
+                eprintln!("CSSWITCH_REAL_AGENT_WRITE_REBUILD_FROM_STORE=PASS");
+            }
+            let _ = assert_security_stub_boundary(
+                &sandbox_home,
+                1,
+                &tmp.join("science-enabled.stderr.log"),
+            );
+            return;
+        }
 
         let skills_snapshot = open_science_skills_ui(&mut guard).unwrap();
         let expected_catalog_button = format!(
@@ -2688,6 +2915,7 @@ esac
         )
         .unwrap();
         let enabled = wait_for_skill_mock_round(&mock);
+        eprintln!("CSSWITCH_REAL_AGENT_TOOLS={:?}", enabled.available_tools);
         assert_eq!(enabled.main_count, 2);
         assert_eq!(
             enabled.skill_schema_fields,
@@ -3189,6 +3417,7 @@ esac
         let mock = SkillMockServer::start(
             installed.runtime_name.clone(),
             NATURE_CONTENT_MARKER.to_string(),
+            None,
         );
         let port = free_port();
         let sandbox_port = free_port();
@@ -3690,18 +3919,18 @@ esac
                 &catalog,
             )
             .unwrap();
-        let pending =
+        let automatically_restarted =
             sandbox_session::one_click_login(handle.clone(), state.clone(), lifecycle.as_ref())
-                .expect("running Science should report a required Skill restart");
-        assert_eq!(pending["action"], "restart_required");
-        assert_eq!(pending["restart_required"], true);
+                .expect("running Science should automatically restart for a Skill change");
+        assert_eq!(automatically_restarted["action"], "started");
+        wait_http_health(sandbox_port);
         assert_eq!(
             fs::read_to_string(fake_state_dir.join("serve-count")).unwrap(),
-            "1"
+            "2"
         );
         assert_eq!(
             fs::read(skill_runtime.join("SKILL.md")).unwrap(),
-            deployed_before_update
+            fs::read(skill_source.join("SKILL.md")).unwrap()
         );
         {
             let mut st = lock(&state);
@@ -3720,7 +3949,7 @@ esac
         assert!(unknown.contains("无法确认隔离 Science 是否已停止"));
         assert_eq!(
             fs::read(skill_runtime.join("SKILL.md")).unwrap(),
-            deployed_before_update
+            fs::read(skill_source.join("SKILL.md")).unwrap()
         );
         fs::remove_file(fake_state_dir.join("pid")).unwrap();
         let restarted =
@@ -3730,7 +3959,7 @@ esac
         wait_http_health(sandbox_port);
         assert_eq!(
             fs::read_to_string(fake_state_dir.join("serve-count")).unwrap(),
-            "2"
+            "3"
         );
         assert_eq!(
             fs::read(skill_runtime.join("SKILL.md")).unwrap(),

@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.4.3] — 2026-07-12
+
+### Fixed
+
+- Import a single-file Skill created by a Science agent as `<name>.skill.md` in the active workspace root, then persist it in the CSSwitch store and deploy it through the existing serialized Science lifecycle.
+- Automatically restart isolated Science when a managed Skill changes, so one click completes import, deployment, and activation without a separate manual stop/start cycle.
+- Recover from `STORE_CONFLICT` without deleting evidence: quarantine the complete old Skill root, re-inspect and restore valid payloads, preserve skipped content in the quarantine, and retry startup once.
+
+### Safety
+
+- Workspace ingress is limited to direct `*.skill.md` files under the trusted active organization, rejects symlinks and hardlinks, caps size/count, verifies a stable file identity, and never reads credentials or arbitrary HOME paths.
+- Product wording now consistently describes CSSwitch as a configuration converter that connects Science to the user's own API.
+
 CSSwitch follows semantic versioning. Older release notes remain available on the [GitHub Releases page](https://github.com/SuperJJ007/CSSwitch/releases).
 
 ## [0.4.2] — 2026-07-12

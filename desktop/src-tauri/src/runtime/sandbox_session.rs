@@ -22,6 +22,7 @@ use crate::skill_manager::discovery::ScienceProbeState;
 use crate::skill_manager::error::SkillManagerError;
 use crate::skill_manager::external::external_skills_root_from_process_home;
 use crate::skill_manager::store::SkillManager;
+use crate::skill_manager::workspace_ingress::{scan_workspace_skill_files, WorkspaceIngressReport};
 use crate::{config, lifecycle, lock, oauth_forge, proc, AppState, SharedAppState};
 
 fn skill_error_text(error: SkillManagerError) -> String {
@@ -50,6 +51,33 @@ fn reconcile_error_text(report: &ReconcileReport) -> Option<String> {
             error.code, error.message, error.remediation
         )
     })
+}
+
+fn with_store_recovery<T>(
+    skills: &SkillManager,
+    trace: &OperationTrace,
+    mut operation: impl FnMut() -> Result<T, SkillManagerError>,
+) -> Result<T, SkillManagerError> {
+    match operation() {
+        Err(error) if error.code == crate::skill_manager::error::SkillErrorCode::StoreConflict => {
+            let recovery = skills.quarantine_and_restore_store()?;
+            trace.stage(
+                OperationStage::Precheck,
+                format!(
+                    "skill_store_recovered recovered={} skipped={} quarantine={}",
+                    recovery.recovered,
+                    recovery.skipped,
+                    recovery
+                        .quarantine_path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("redacted")
+                ),
+            );
+            operation()
+        }
+        result => result,
+    }
 }
 
 fn stop_sandbox_state<R: Runtime>(
@@ -121,18 +149,25 @@ pub(crate) fn one_click_login<R: Runtime>(
 
     if science_state == SandboxScienceState::RunningHealthy {
         let science_version = sandbox_science_version();
-        let (external_scan, dry) = scan_and_reconcile_skills_for_runtime(
-            &skills,
-            RuntimeSkillReconcileContext {
-                external_root: &external_root,
-                data_dir: &data_dir,
-                dry_run: true,
-                reason: "running_check",
-                science_version: science_version.as_deref(),
-                runtime_mode: &cfg.mode,
-                science_state: ScienceProbeState::Running,
-            },
-        )
+        let workspace_ingress = with_store_recovery(&skills, &trace, || {
+            scan_workspace_skill_files(&skills, &data_dir)
+        })
+        .map_err(skill_error_text)?;
+        trace_workspace_ingress(&trace, &workspace_ingress);
+        let (external_scan, dry) = with_store_recovery(&skills, &trace, || {
+            scan_and_reconcile_skills_for_runtime(
+                &skills,
+                RuntimeSkillReconcileContext {
+                    external_root: &external_root,
+                    data_dir: &data_dir,
+                    dry_run: true,
+                    reason: "running_check",
+                    science_version: science_version.as_deref(),
+                    runtime_mode: &cfg.mode,
+                    science_state: ScienceProbeState::Running,
+                },
+            )
+        })
         .map_err(skill_error_text)?;
         trace_external_scan(&trace, &external_scan);
         if let Some(error) = reconcile_error_text(&dry) {
@@ -141,44 +176,46 @@ pub(crate) fn one_click_login<R: Runtime>(
         }
         let pending_restart = skills.has_pending_restart().map_err(skill_error_text)?;
         if dry.restart_required || pending_restart {
-            trace.finish("ok action=restart_required reason=skills_changed");
-            return Ok(json!({
-                "url": sandbox_url(sport),
-                "msg": "Skill 已变更，需要先停止并重新启动隔离 Science 后才会生效。",
-                "action": "restart_required",
-                "restart_required": true
-            }));
-        }
-        let (_, _, proxy_action) = ensure_proxy(&app, &state, lifecycle, Some(&trace))?;
-        if oauth_forge::login_intact(&auth_dir, "virtual@localhost.invalid", &sbx_home) {
-            let url = sandbox_url(sport);
             {
                 let mut st = lock(&state);
-                st.sandbox_port = sport;
-                st.sandbox_url = Some(url.clone());
+                if let Err(error) = stop_sandbox_state(&app, &mut st) {
+                    trace.finish("error=sandbox_stop_for_skill_restart");
+                    return Err(format!("Skill 已入库，但隔离 Science 停止失败：{error}"));
+                }
             }
-            let base = match proxy_action {
-                ProxyAction::Reused => "已在运行",
-                ProxyAction::Restarted => "已用新配置重启代理，Science 沿用不变",
-            };
-            let msg = match open_science_surface(&app, &url) {
-                Ok("webview") => format!("{base}，已重新打开 Science 窗口。"),
-                Ok(_) => format!("{base}，已重新打开 Science。"),
-                Err(_) => format!("{base}，服务已就绪，请手动打开：{url}"),
-            };
-            trace.finish(format!(
-                "ok action=reopened proxy_action={}",
-                proxy_action.as_str()
-            ));
-            return Ok(json!({ "url": url, "msg": msg, "action": "reopened" }));
-        }
-        {
-            let mut st = lock(&state);
-            if let Err(error) = stop_sandbox_state(&app, &mut st) {
-                trace.finish("error=sandbox_stop_before_skill_reconcile");
-                return Err(format!(
-                    "隔离 Science 停止失败，为避免热改 Skill，未执行 reconcile：{error}"
+            trace.stage(OperationStage::Precheck, "skills_changed restart=automatic");
+        } else {
+            let (_, _, proxy_action) = ensure_proxy(&app, &state, lifecycle, Some(&trace))?;
+            if oauth_forge::login_intact(&auth_dir, "virtual@localhost.invalid", &sbx_home) {
+                let url = sandbox_url(sport);
+                {
+                    let mut st = lock(&state);
+                    st.sandbox_port = sport;
+                    st.sandbox_url = Some(url.clone());
+                }
+                let base = match proxy_action {
+                    ProxyAction::Reused => "已在运行",
+                    ProxyAction::Restarted => "已用新配置重启代理，Science 沿用不变",
+                };
+                let msg = match open_science_surface(&app, &url) {
+                    Ok("webview") => format!("{base}，已重新打开 Science 窗口。"),
+                    Ok(_) => format!("{base}，已重新打开 Science。"),
+                    Err(_) => format!("{base}，服务已就绪，请手动打开：{url}"),
+                };
+                trace.finish(format!(
+                    "ok action=reopened proxy_action={}",
+                    proxy_action.as_str()
                 ));
+                return Ok(json!({ "url": url, "msg": msg, "action": "reopened" }));
+            }
+            {
+                let mut st = lock(&state);
+                if let Err(error) = stop_sandbox_state(&app, &mut st) {
+                    trace.finish("error=sandbox_stop_before_skill_reconcile");
+                    return Err(format!(
+                        "隔离 Science 停止失败，为避免热改 Skill，未执行 reconcile：{error}"
+                    ));
+                }
             }
         }
     }
@@ -194,18 +231,25 @@ pub(crate) fn one_click_login<R: Runtime>(
         oauth_forge::ensure_virtual_login(&auth_dir, "virtual@localhost.invalid", &sbx_home)
             .map_err(|e| format!("写虚拟登录失败：{e}"))?;
     let science_version = sandbox_science_version();
-    let (external_scan, reconcile) = scan_and_reconcile_skills_for_runtime(
-        &skills,
-        RuntimeSkillReconcileContext {
-            external_root: &external_root,
-            data_dir: &data_dir,
-            dry_run: false,
-            reason: "before_start",
-            science_version: science_version.as_deref(),
-            runtime_mode: &cfg.mode,
-            science_state: ScienceProbeState::NotRunning,
-        },
-    )
+    let workspace_ingress = with_store_recovery(&skills, &trace, || {
+        scan_workspace_skill_files(&skills, &data_dir)
+    })
+    .map_err(skill_error_text)?;
+    trace_workspace_ingress(&trace, &workspace_ingress);
+    let (external_scan, reconcile) = with_store_recovery(&skills, &trace, || {
+        scan_and_reconcile_skills_for_runtime(
+            &skills,
+            RuntimeSkillReconcileContext {
+                external_root: &external_root,
+                data_dir: &data_dir,
+                dry_run: false,
+                reason: "before_start",
+                science_version: science_version.as_deref(),
+                runtime_mode: &cfg.mode,
+                science_state: ScienceProbeState::NotRunning,
+            },
+        )
+    })
     .map_err(skill_error_text)?;
     trace_external_scan(&trace, &external_scan);
     if let Some(error) = reconcile_error_text(&reconcile) {
@@ -323,6 +367,19 @@ pub(crate) fn one_click_login<R: Runtime>(
         proxy_action.as_str()
     ));
     Ok(json!({ "url": url, "msg": msg, "action": "started" }))
+}
+
+fn trace_workspace_ingress(trace: &OperationTrace, report: &WorkspaceIngressReport) {
+    trace.stage(
+        OperationStage::Precheck,
+        format!(
+            "workspace_skill_ingress discovered={} imported={} unchanged={} diagnostics={}",
+            report.discovered,
+            report.imported,
+            report.unchanged,
+            report.diagnostics.len()
+        ),
+    );
 }
 
 fn trace_external_scan(
