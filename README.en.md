@@ -1,18 +1,27 @@
 # CSSwitch Linux
 
-A pure CLI port of [CSSwitch v0.4.4](https://github.com/SuperJJ007/CSSwitch) for **Linux, WSL, and headless environments**. Route Claude Science inference requests through your own model API (DeepSeek, Qwen, Kimi, GLM, OpenRouter, custom endpoints).
+A pure CLI port of [CSSwitch v0.4.4](https://github.com/SuperJJ007/CSSwitch) for **Linux, WSL, and headless environments**. Route Claude Science inference through your own model API.
 
-Built with Rust. No GUI, no Tauri, no Node.js runtime required.
+## Install
 
-## Quick Start
+**Via deb (Debian/Ubuntu):**
 
 ```bash
-npm install -g @anthropic-ai/claude-science
+curl -LO https://github.com/YuntaoOvO/CSSwitch-Linux/releases/latest/download/csswitch_0.5.0_amd64.deb
+sudo dpkg -i csswitch_0.5.0_amd64.deb
+```
+
+**From source:**
+
+```bash
 git clone https://github.com/YuntaoOvO/CSSwitch-Linux.git
 cd CSSwitch-Linux
-cargo build --release -p csswitch-gateway -p csswitch
-sudo cp target/release/csswitch target/release/csswitch-gateway /usr/local/bin/
+make && sudo make install
+```
 
+## Usage
+
+```bash
 csswitch profile add --template deepseek --name "DS" --key sk-xxx
 csswitch profile activate <id>
 csswitch daemon start
@@ -21,6 +30,14 @@ claude-science
 ```
 
 Full documentation: [简体中文 README](./README.md)
+
+## Build
+
+```bash
+cargo build --release -p csswitch -p csswitch-gateway
+make deb          # → releases/csswitch_0.5.0_amd64.deb
+make install      # → /usr/local/bin/csswitch
+```
 
 This project is based on [CSSwitch](https://github.com/SuperJJ007/CSSwitch) by SuperJJ007.
 
