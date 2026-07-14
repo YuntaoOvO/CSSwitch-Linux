@@ -10,7 +10,7 @@ use crate::provider::{
     gateway_kind_for_adapter,
     current_shim_mode_for_adapter, ProxyLaunch,
 };
-use crate::proxy::{ProxyAction, health_timeout_reason};
+use crate::proxy::{ProxyAction};
 use crate::system::{open_log, tail_file, redact, log_path};
 use crate::RuntimeContext;
 
@@ -75,13 +75,19 @@ pub fn start_gateway(
     let log_file = open_log("proxy.log")
         .map_err(|e| format!("无法打开代理日志：{e}"))?;
 
+    // Pre-flight: verify the gateway binary is executable
+    match Command::new(&bin).arg("--version").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status() {
+        Ok(_) => {},  // any exit code is fine — just checking it can launch at all
+        Err(e) => return Err(format!("无法执行 csswitch-gateway（{}）：{}。请确认已通过 sudo dpkg -i 安装，且系统安装了 openssl。", bin.display(), e)),
+    }
+
     let mut cmd = Command::new(&bin);
     cmd.arg("--provider").arg(&launch.adapter)
         .arg("--port").arg(port.to_string())
         .arg("--auth-token").arg(_secret)
         .stdin(Stdio::null())
         .stdout(log_file.try_clone().map_err(|e| format!("{e}"))?)
-        .stderr(log_file);
+        .stderr(Stdio::piped());  // capture stderr for error diagnostics
 
     // Inject provider key as env var (NEVER in argv)
     cmd.env(&launch.key_env, &launch.key);
@@ -107,17 +113,31 @@ pub fn start_gateway(
     Ok(child)
 }
 
-/// Perform HTTP health check against the proxy.
+/// Perform HTTP health check against the proxy using raw TCP (no reqwest dependency).
 pub fn proxy_health(port: u16, _secret: &str) -> bool {
-    let url = format!("http://127.0.0.1:{port}/health");
-    match reqwest::blocking::Client::new()
-        .get(&url)
-        .timeout(Duration::from_millis(LOCAL_HEALTH_TIMEOUT_MS))
-        .send()
-    {
-        Ok(resp) => resp.status().is_success(),
-        Err(_) => false,
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    let mut stream = match TcpStream::connect_timeout(
+        &format!("127.0.0.1:{port}").parse().unwrap(),
+        Duration::from_millis(2000),
+    ) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(2000)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(2000)));
+
+    let req = "GET /health HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n";
+    if stream.write_all(req.as_bytes()).is_err() {
+        return false;
     }
+
+    let mut buf = [0u8; 128];
+    let n = stream.read(&mut buf).unwrap_or(0);
+    let response = String::from_utf8_lossy(&buf[..n]);
+    response.contains("200") || response.contains("OK")
 }
 
 /// Ensure the proxy is running with the correct configuration.
@@ -187,12 +207,39 @@ pub fn ensure_proxy(
     }
 
     if !healthy {
-        let tail = redact(
-            &tail_file(&log_path("proxy.log"), 600),
-            &secret,
-        );
+        // Gather all diagnostic info
+        let log_tail = redact(&tail_file(&log_path("proxy.log"), 600), &secret);
+        let mut stderr_out = String::new();
+        if let Some(ref mut s) = child.stderr {
+            use std::io::Read;
+            let _ = s.read_to_string(&mut stderr_out);
+        }
+        let stderr_tail = redact(&stderr_out, &secret);
+
+        let mut diag = format!("代理端口 {} 探活超时。", port);
+        if !log_tail.is_empty() {
+            diag.push_str(&format!("
+[stdout]
+{}", log_tail));
+        }
+        if !stderr_tail.is_empty() {
+            diag.push_str(&format!("
+[stderr]
+{}", stderr_tail));
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                diag.push_str(&format!("
+gateway 进程已退出，退出码 {:?}", status.code()));
+            },
+            Ok(None) => {
+                diag.push_str("
+gateway 进程仍在运行但端口不可达，可能是上游连接失败。");
+            },
+            Err(_) => {},
+        }
         let _ = child.kill();
-        return Err(health_timeout_reason(port, &tail));
+        return Err(diag);
     }
 
     // Update state

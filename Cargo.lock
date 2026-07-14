@@ -157,7 +157,6 @@ dependencies = [
  "csswitch-templates",
  "dirs",
  "libc",
- "reqwest",
  "serde",
  "serde_json",
 ]
@@ -200,7 +199,6 @@ dependencies = [
  "csswitch-config",
  "csswitch-templates",
  "dirs",
- "reqwest",
  "serde",
  "serde_json",
 ]

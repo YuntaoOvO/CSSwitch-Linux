@@ -76,13 +76,23 @@ fn is_executable(path: &Path) -> bool {
 
 /// Check if the Science sandbox is running and healthy.
 pub fn sandbox_health(port: u16) -> bool {
-    let url = format!("http://127.0.0.1:{port}");
-    reqwest::blocking::Client::new()
-        .get(&url)
-        .timeout(Duration::from_millis(LOCAL_HEALTH_TIMEOUT_MS))
-        .send()
-        .map(|r| r.status().is_success())
-        .unwrap_or(false)
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    let addr = format!("127.0.0.1:{port}");
+    let mut stream = match TcpStream::connect_timeout(
+        &addr.parse().unwrap(),
+        Duration::from_millis(2000),
+    ) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(2000)));
+    let req = "GET / HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n";
+    if stream.write_all(req.as_bytes()).is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 64];
+    stream.read(&mut buf).unwrap_or(0) > 0
 }
 
 /// Check if the running sandbox at the given port belongs to us

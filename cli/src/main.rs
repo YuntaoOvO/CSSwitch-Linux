@@ -377,12 +377,7 @@ fn handle_proxy(ctx: &dyn RuntimeContext, args: &Args) -> Result<(), String> {
         "status" => {
             let st = csswitch_runtime::lock(&state);
             if st.secret.len() > 0 {
-                let healthy = reqwest::blocking::Client::new()
-                    .get(format!("http://127.0.0.1:{}/health", st.proxy_port))
-                    .timeout(std::time::Duration::from_secs(2))
-                    .send()
-                    .map(|r| r.status().is_success())
-                    .unwrap_or(false);
+                let healthy = csswitch_runtime::proxy_lifecycle::proxy_health(st.proxy_port, &st.secret);
                 if healthy {
                     println!("代理状态: 运行中 (端口 {}, provider: {})", st.proxy_port, st.provider);
                 } else {
@@ -496,13 +491,7 @@ fn handle_run(args: &Args) -> Result<(), String> {
     };
 
     // Check proxy health
-    if !reqwest::blocking::Client::new()
-        .get(format!("http://127.0.0.1:{port}/health"))
-        .timeout(std::time::Duration::from_secs(2))
-        .send()
-        .map(|r| r.status().is_success())
-        .unwrap_or(false)
-    {
+    if !csswitch_runtime::proxy_lifecycle::proxy_health(port, &secret) {
         return Err("代理未运行或不可达，请先运行 `csswitch proxy start`".to_string());
     }
 
@@ -649,12 +638,7 @@ fn handle_daemon(ctx: &dyn RuntimeContext, args: &Args) -> Result<(), String> {
                         let dir = csswitch_config::default_dir();
                         if let Ok(cfg) = csswitch_config::load_from(&dir) {
                             let port = cfg.proxy_port;
-                            let healthy = reqwest::blocking::Client::new()
-                                .get(format!("http://127.0.0.1:{port}/health"))
-                                .timeout(std::time::Duration::from_secs(2))
-                                .send()
-                                .map(|r| r.status().is_success())
-                                .unwrap_or(false);
+                            let healthy = csswitch_runtime::proxy_lifecycle::proxy_health(port, &cfg.secret);
                             if healthy {
                                 println!("Daemon: 运行中 (PID {pid}, 端口 {port})");
                             } else {

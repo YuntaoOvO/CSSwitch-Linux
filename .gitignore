@@ -65,6 +65,6 @@ docs/*
 !docs/references/**
 !docs/upgrade-and-rollback.md
 !docs/release-evidence-v0.4.2.md
-
+HANDOFF.md
 # Release artifacts (published as GitHub Release attachments)
 releases/
