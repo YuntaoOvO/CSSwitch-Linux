@@ -141,7 +141,7 @@ fn has_flag(flags: &[(String, Option<String>)], name: &str) -> bool {
 }
 
 fn print_usage() {
-    println!(r#"CSSwitch CLI v1.1.1 – provider switcher for Claude Science
+    println!(r#"CSSwitch CLI v1.2.0 – provider switcher for Claude Science
 
 USAGE:
   csswitch <command> [subcommand] [flags] [args]
@@ -509,9 +509,9 @@ fn handle_run(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
-// ── Hook commands ──
-
 const HOOK_MARKER: &str = "# CSSWITCH_HOOK";
+
+// ── Hook commands ──
 
 fn handle_hook(args: &Args) -> Result<(), String> {
     match args.subcommand.as_str() {
@@ -520,7 +520,9 @@ fn handle_hook(args: &Args) -> Result<(), String> {
             let rc_file = shell_rc_file(&shell)?;
 
             let hook_script = format!(
-                "{}\ncsswitch() {{\n  command csswitch \"$@\"\n}}\n",
+                "{0}\n# CSSwitch shell integration\n\
+csswitch() {{ command csswitch \"\x24@\"; }}\n\
+# Run: eval \"\x24(csswitch env)\" to inject proxy environment\n",
                 HOOK_MARKER
             );
 
@@ -531,28 +533,33 @@ fn handle_hook(args: &Args) -> Result<(), String> {
             }
 
             let mut f = std::fs::OpenOptions::new()
-                .append(true)
-                .create(true)
+                .append(true).create(true)
                 .open(&rc_file)
-                .map_err(|e| format!("无法打开 {}：{e}", rc_file.display()))?;
+                .map_err(|e| format!("无法打开 {}：{}", rc_file.display(), e))?;
             writeln!(f, "\n{}", hook_script)
-                .map_err(|e| format!("写入失败：{e}"))?;
+                .map_err(|e| format!("写入失败：{}", e))?;
 
-            println!("Hook 已安装到 {}。重新打开终端或 `source {}` 生效。", rc_file.display(), rc_file.display());
+            println!("Hook 已安装到 {}。", rc_file.display());
+            println!("使用方法：终端里执行 eval \"\\x24(csswitch env)\" 注入代理环境。");
             Ok(())
         }
         "uninstall" => {
             let shell = flag_value(&args.flags, "shell").unwrap_or_else(|| "bash".to_string());
             let rc_file = shell_rc_file(&shell)?;
             let content = std::fs::read_to_string(&rc_file).unwrap_or_default();
-            let new_content: String = content
-                .lines()
-                .filter(|line| !line.contains(HOOK_MARKER))
-                .collect::<Vec<_>>()
-                .join("\n");
+            let hook_start = format!("# {}", HOOK_MARKER);
+            let new_content = if let Some(pos) = content.find(&hook_start) {
+                let tail = &content[pos..];
+                let block_end = tail.find("\n\n").unwrap_or(tail.len());
+                let mut s = String::with_capacity(content.len());
+                s.push_str(&content[..pos]);
+                let remaining = pos + block_end + 1;
+                if remaining < content.len() { s.push_str(&content[remaining..]); }
+                s
+            } else { content };
             std::fs::write(&rc_file, new_content.trim_end().to_string() + "\n")
-                .map_err(|e| format!("写入失败：{e}"))?;
-            println!("Hook 已从 {} 中移除", rc_file.display());
+                .map_err(|e| format!("写入失败：{}", e))?;
+            println!("Hook 已从 {} 中移除。", rc_file.display());
             Ok(())
         }
         _ => Err("用法：csswitch hook install|uninstall [--shell bash|zsh|fish]".to_string()),

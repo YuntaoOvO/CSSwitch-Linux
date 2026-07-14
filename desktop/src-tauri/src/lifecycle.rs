@@ -42,6 +42,7 @@ impl Lifecycle {
         self.generation.fetch_add(1, Ordering::SeqCst) + 1
     }
 
+    #[allow(dead_code)]
     pub fn current_generation(&self) -> u64 {
         self.generation.load(Ordering::SeqCst)
     }

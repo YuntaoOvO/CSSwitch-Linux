@@ -1,131 +1,27 @@
-//! 进程管家用到的纯 std 辅助：探活、一次性 secret 生成、上游可达性。
+//! 进程管家用到的纯 std 辅助：探活、依赖定位、一次性 secret 生成、上游可达性。
 //! 无第三方依赖，便于单测；有状态的子进程编排放在 lib.rs（持 Child 句柄）。
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::time::Duration;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ChildLiveness {
-    Running,
-    Exited(String),
-    Unknown(String),
-}
-
-fn classify_child_try_wait(
-    result: std::io::Result<Option<std::process::ExitStatus>>,
-) -> ChildLiveness {
-    match result {
-        Ok(None) => ChildLiveness::Running,
-        Ok(Some(status)) => ChildLiveness::Exited(status.to_string()),
-        Err(error) => ChildLiveness::Unknown(error.to_string()),
-    }
-}
-
-pub fn poll_child_liveness(child: &mut std::process::Child) -> ChildLiveness {
-    classify_child_try_wait(child.try_wait())
-}
-
-pub fn tracked_child_is_running(child: &mut Option<std::process::Child>) -> bool {
-    child
-        .as_mut()
-        .map(|child| matches!(poll_child_liveness(child), ChildLiveness::Running))
-        .unwrap_or(false)
-}
-
-/// Check whether a loopback TCP port is already accepting connections without
-/// sending any HTTP bytes or path secret to the listener.
-pub fn loopback_port_in_use(port: u16, timeout_ms: u64) -> bool {
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    TcpStream::connect_timeout(&addr, Duration::from_millis(timeout_ms)).is_ok()
-}
-
-/// Final publish/probe guard used immediately before exposing a child as usable.
-/// It is deliberately fail-closed for both an observed exit and an indeterminate poll.
-pub fn require_child_running(child: &mut std::process::Child, context: &str) -> Result<(), String> {
-    match poll_child_liveness(child) {
-        ChildLiveness::Running => Ok(()),
-        ChildLiveness::Exited(status) => Err(format!("{context}提前退出（{status}）")),
-        ChildLiveness::Unknown(error) => Err(format!("{context}存活状态未知：{error}")),
-    }
-}
 
 /// 对本地回环代理做 HTTP 探活：`GET /<secret>/health`，响应状态行含 200 即视为健康。
 /// 代理带 path-secret 鉴权时必须带上 secret，否则会拿到 403。
 pub fn http_health(port: u16, secret: Option<&str>, timeout_ms: u64) -> bool {
-    http_health_response(port, secret, timeout_ms).is_some()
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GatewayHealth {
-    pub gateway: String,
-    pub provider: String,
-    pub shim: String,
-    pub launch_id: String,
-}
-
-/// 读取 Rust gateway 声明的运行身份。
-pub fn http_gateway_health(
-    port: u16,
-    secret: Option<&str>,
-    timeout_ms: u64,
-) -> Option<GatewayHealth> {
-    let response = http_health_response(port, secret, timeout_ms)?;
-    gateway_health_from_response(&response)
-}
-
-/// CSSwitch proxy 强身份探活。Managed Rust launch 必须匹配
-/// gateway/provider/shim/launch_id；launch_id 防止同端口同 secret、甚至同
-/// provider/shim 的旧 gateway 冒充新 child。
-pub fn http_health_gateway(
-    port: u16,
-    secret: Option<&str>,
-    timeout_ms: u64,
-    expected_gateway: &str,
-    expected_provider: Option<&str>,
-    expected_shim: Option<&str>,
-    expected_launch_id: Option<&str>,
-) -> bool {
-    let Some(actual) = http_gateway_health(port, secret, timeout_ms) else {
-        return false;
-    };
-    gateway_health_matches(
-        &actual,
-        expected_gateway,
-        expected_provider,
-        expected_shim,
-        expected_launch_id,
-    )
-}
-
-fn gateway_health_matches(
-    actual: &GatewayHealth,
-    expected_gateway: &str,
-    expected_provider: Option<&str>,
-    expected_shim: Option<&str>,
-    expected_launch_id: Option<&str>,
-) -> bool {
-    actual.gateway == expected_gateway
-        && expected_provider
-            .map(|expected| actual.provider == expected)
-            .unwrap_or(true)
-        && expected_shim
-            .map(|expected| actual.shim == expected)
-            .unwrap_or(true)
-        && expected_launch_id
-            .map(|expected| !expected.is_empty() && actual.launch_id == expected)
-            .unwrap_or(true)
-}
-
-fn http_health_response(port: u16, secret: Option<&str>, timeout_ms: u64) -> Option<String> {
-    let addr = ("127.0.0.1", port)
+    let addr = match ("127.0.0.1", port)
         .to_socket_addrs()
         .ok()
-        .and_then(|mut a| a.next())?;
+        .and_then(|mut a| a.next())
+    {
+        Some(a) => a,
+        None => return false,
+    };
     let dur = Duration::from_millis(timeout_ms);
     let mut stream = match TcpStream::connect_timeout(&addr, dur) {
         Ok(s) => s,
-        Err(_) => return None,
+        Err(_) => return false,
     };
     let _ = stream.set_read_timeout(Some(dur));
     let _ = stream.set_write_timeout(Some(dur));
@@ -135,10 +31,10 @@ fn http_health_response(port: u16, secret: Option<&str>, timeout_ms: u64) -> Opt
     };
     let req = format!("GET {path} HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
     if stream.write_all(req.as_bytes()).is_err() {
-        return None;
+        return false;
     }
     let mut buf = Vec::new();
-    // 读完整个小 health 响应；读上限防呆，超时则用已读内容判定。
+    // 只需读到状态行；读上限防呆。
     let mut chunk = [0u8; 1024];
     while buf.len() < 8192 {
         match stream.read(&mut chunk) {
@@ -146,59 +42,14 @@ fn http_health_response(port: u16, secret: Option<&str>, timeout_ms: u64) -> Opt
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
             Err(_) => break,
         }
-        if let Some(expected) = expected_http_response_len(&buf) {
-            if buf.len() >= expected {
-                break;
-            }
+        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
         }
     }
-    let resp = String::from_utf8_lossy(&buf).to_string();
-    let status_line = resp.lines().next().unwrap_or("");
+    let head = String::from_utf8_lossy(&buf);
+    let status_line = head.lines().next().unwrap_or("");
     // 形如 "HTTP/1.1 200 OK"：严格取第二段等于 200，避免 contains 误配 reason phrase。
-    if status_line.split_whitespace().nth(1) == Some("200") {
-        Some(resp)
-    } else {
-        None
-    }
-}
-
-fn gateway_health_from_response(resp: &str) -> Option<GatewayHealth> {
-    let (_, body) = resp.split_once("\r\n\r\n")?;
-    let value: serde_json::Value = serde_json::from_str(body).ok()?;
-    let string_field = |name: &str| {
-        value
-            .get(name)
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .to_string()
-    };
-    let gateway = string_field("gateway");
-    if gateway.is_empty() {
-        return None;
-    }
-    Some(GatewayHealth {
-        gateway,
-        provider: string_field("provider"),
-        shim: string_field("shim"),
-        launch_id: string_field("launch_id"),
-    })
-}
-
-fn expected_http_response_len(buf: &[u8]) -> Option<usize> {
-    let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
-    let head = String::from_utf8_lossy(&buf[..header_end]);
-    for line in head.lines() {
-        let (name, value) = match line.split_once(':') {
-            Some(parts) => parts,
-            None => continue,
-        };
-        if name.trim().eq_ignore_ascii_case("content-length") {
-            if let Ok(len) = value.trim().parse::<usize>() {
-                return Some(header_end + len);
-            }
-        }
-    }
-    Some(header_end)
+    status_line.split_whitespace().nth(1) == Some("200")
 }
 
 /// 向本地回环代理 POST 一段 JSON（`POST /<secret><path>`），返回 HTTP 响应状态码；
@@ -312,6 +163,152 @@ pub fn tcp_reachable(host: &str, port: u16, timeout_ms: u64) -> bool {
     }
 }
 
+/// 在 PATH 里找可执行文件（简易 which），并对 macOS GUI 最小 PATH 做兜底。
+///
+/// 从访达 / .app 启动的 GUI 进程拿到的是最小 PATH（`/usr/bin:/bin:/usr/sbin:/sbin`），
+/// **不含** Homebrew(`/usr/local/bin`、`/opt/homebrew/bin`)、nvm / volta / asdf 等
+/// node 常见安装位置 → `which("node")` 在正常 PATH 里查不到（`python3` 因
+/// `/usr/bin/python3` 在系统 PATH 里才没事）。故 PATH 未命中时，再扫一遍
+/// [`common_bin_dirs`] 里的常见安装目录（修 #2）。找不到返回 None。
+pub fn which(name: &str) -> Option<PathBuf> {
+    // 绝对/相对路径直接判定。
+    let p = PathBuf::from(name);
+    if p.is_absolute() {
+        return if is_exec(&p) { Some(p) } else { None };
+    }
+    // 1) 正常 PATH（从终端启动时够用）。PATH 缺失也不早退，继续走兜底。
+    if let Some(path) = std::env::var_os("PATH") {
+        if let Some(hit) = find_in_dirs(name, std::env::split_paths(&path)) {
+            return Some(hit);
+        }
+    }
+    // 2) GUI/.app 最小 PATH 兜底：扫常见安装目录。
+    find_in_dirs(name, common_bin_dirs())
+}
+
+/// 在给定目录序列里找可执行文件（第一个命中即返回）。
+fn find_in_dirs(name: &str, dirs: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    for dir in dirs {
+        let cand = dir.join(name);
+        if is_exec(&cand) {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+/// node/python 等的常见安装目录（不含系统最小 PATH 已覆盖的 `/usr/bin` 等）。
+/// macOS：Homebrew、MacPorts、volta、asdf、~/.local/bin、nvm。
+/// Linux：/usr/local/bin、~/.local/bin、~/.cargo/bin、volta、asdf、nvm。
+fn common_bin_dirs() -> Vec<PathBuf> {
+    let mut dirs = if cfg!(target_os = "macos") {
+        vec![
+            PathBuf::from("/opt/homebrew/bin"), // Homebrew（Apple Silicon）
+            PathBuf::from("/usr/local/bin"),    // Homebrew（Intel）/ 手动安装
+            PathBuf::from("/opt/local/bin"),    // MacPorts
+        ]
+    } else {
+        vec![
+            PathBuf::from("/usr/local/bin"), // Linux 手动安装
+        ]
+    };
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        dirs.push(home.join(".volta/bin"));
+        dirs.push(home.join(".asdf/shims"));
+        dirs.push(home.join(".local/bin"));
+        if !cfg!(target_os = "macos") {
+            dirs.push(home.join(".cargo/bin")); // Rust 工具链（Linux 常见）
+        }
+        // nvm：版本目录动态，枚举 ~/.nvm/versions/node/*/bin。
+        if let Ok(entries) = std::fs::read_dir(home.join(".nvm/versions/node")) {
+            for e in entries.flatten() {
+                dirs.push(e.path().join("bin"));
+            }
+        }
+    }
+    dirs
+}
+
+/// [`which`] 找不到时的最后兜底：用登录 shell 解析用户的**真实 PATH**。
+///
+/// GUI 从桌面启动只有最小 PATH，且用户可能用 fnm / nvm / asdf 等在 shell rc
+/// 里配置的版本管理器（[`common_bin_dirs`] 的静态枚举覆盖不到）。这里跑
+/// `$SHELL -lic 'command -v <name>'`（登录 + 交互 shell，会 source 用户 rc）拿其真实
+/// 解析路径。用独立线程 + `recv_timeout` 兜底，病态 rc 不会卡死调用方。
+/// macOS 默认 zsh，Linux 优先 $SHELL 否则回退 bash。
+pub fn which_via_login_shell(name: &str) -> Option<PathBuf> {
+    // name 出自本代码（"node"/"python3"），仍做白名单，杜绝拼进 shell 的注入面。
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+'))
+    {
+        return None;
+    }
+    let arg = format!("command -v {name} 2>/dev/null");
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| {
+        if cfg!(target_os = "macos") {
+            "/bin/zsh".to_string()
+        } else {
+            "/bin/bash".to_string()
+        }
+    });
+    // spawn + 轮询 + 超时 kill：病态 rc 卡死时**终止** shell，绝不泄漏线程/进程（修 P3）。
+    let mut child = Command::new(&shell)
+        .args(["-lic", &arg])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    // 3s 足够 command -v。到点未退则 kill 后放弃。
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(30));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let out = child.wait_with_output().ok()?;
+    // rc 可能往 stdout 打噪声：从后往前取第一条「绝对路径且可执行」的行。
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines().rev() {
+        let p = PathBuf::from(line.trim());
+        if p.is_absolute() && is_exec(&p) {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// 定位可执行文件（含登录 shell 兜底）：[`which`]（PATH + 常见安装目录）未命中时，
+/// 再用 [`which_via_login_shell`] 解析用户真实 PATH。node / python3 都走这个，覆盖
+/// 「GUI 最小 PATH + 版本管理器」这类多位客户反馈的「已装 node 却报缺依赖」（修 #2）。
+pub fn find_exe(name: &str) -> Option<PathBuf> {
+    which(name).or_else(|| which_via_login_shell(name))
+}
+
+fn is_exec(p: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(p) {
+        Ok(md) => md.is_file() && (md.permissions().mode() & 0o111 != 0),
+        Err(_) => false,
+    }
+}
+
 /// 生成一次性 path-secret：从 /dev/urandom 取 16 字节，hex 编码为 32 字符。
 /// 失败关闭：urandom 不可用时返回 Err，绝不退回可猜的弱 secret（宁可起代理失败）。
 pub fn gen_secret() -> std::io::Result<String> {
@@ -335,71 +332,6 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
-
-    #[test]
-    fn loopback_port_occupancy_probe_detects_listener_without_http() {
-        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        assert_ne!(port, 8765);
-        assert!(loopback_port_in_use(port, 200));
-        drop(listener);
-        // Do not assert global vacancy after drop: the parallel test suite may
-        // legitimately acquire this just-released ephemeral port immediately.
-    }
-
-    #[test]
-    fn child_liveness_classifier_fails_closed_for_exit_and_poll_error() {
-        assert_eq!(classify_child_try_wait(Ok(None)), ChildLiveness::Running);
-        let status = Command::new("sh")
-            .args(["-c", "exit 7"])
-            .status()
-            .expect("test shell should exit");
-        assert!(matches!(
-            classify_child_try_wait(Ok(Some(status))),
-            ChildLiveness::Exited(_)
-        ));
-        let unknown = classify_child_try_wait(Err(std::io::Error::other("poll failed")));
-        assert_eq!(unknown, ChildLiveness::Unknown("poll failed".into()));
-    }
-
-    #[test]
-    fn final_child_publish_guard_accepts_running_and_rejects_exited_child() {
-        let mut running = Command::new("sh")
-            .args(["-c", "sleep 5"])
-            .spawn()
-            .expect("test child should start");
-        assert!(require_child_running(&mut running, "test child ").is_ok());
-        let _ = running.kill();
-        let _ = running.wait();
-
-        let mut exited = Command::new("sh")
-            .args(["-c", "exit 9"])
-            .spawn()
-            .expect("test child should start");
-        let _ = exited.wait();
-        let err = require_child_running(&mut exited, "publish child ").unwrap_err();
-        assert!(err.contains("提前退出"));
-    }
-
-    #[test]
-    fn tracked_child_presence_is_not_enough_for_running_status() {
-        let mut absent = None;
-        assert!(!tracked_child_is_running(&mut absent));
-
-        let mut running = Some(
-            Command::new("sh")
-                .args(["-c", "sleep 5"])
-                .spawn()
-                .expect("test child should start"),
-        );
-        assert!(tracked_child_is_running(&mut running));
-        if let Some(child) = running.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        assert!(!tracked_child_is_running(&mut running));
-    }
 
     #[test]
     fn health_false_when_nothing_listening() {
@@ -408,73 +340,90 @@ mod tests {
     }
 
     #[test]
-    fn gateway_health_parses_full_rust_identity() {
-        let rust = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n{\"status\":\"ok\",\"gateway\":\"rust\",\"provider\":\"deepseek\",\"shim\":\"rewrite\",\"launch_id\":\"launch-new\"}";
-        assert_eq!(
-            gateway_health_from_response(rust),
-            Some(GatewayHealth {
-                gateway: "rust".into(),
-                provider: "deepseek".into(),
-                shim: "rewrite".into(),
-                launch_id: "launch-new".into(),
-            })
-        );
-    }
-
-    #[test]
-    fn gateway_health_rejects_missing_or_malformed_identity() {
-        assert!(
-            gateway_health_from_response("HTTP/1.1 200 OK\r\n\r\n{\"status\":\"ok\"}").is_none()
-        );
-        assert!(gateway_health_from_response("HTTP/1.1 200 OK\r\n\r\nnot-json").is_none());
-    }
-
-    #[test]
-    fn managed_health_rejects_old_rust_launch() {
-        let old = GatewayHealth {
-            gateway: "rust".into(),
-            provider: "deepseek".into(),
-            shim: "off".into(),
-            launch_id: "old-launch".into(),
-        };
-        assert!(!gateway_health_matches(
-            &old,
-            "rust",
-            Some("deepseek"),
-            Some("off"),
-            Some("new-launch"),
-        ));
-        assert!(gateway_health_matches(
-            &old,
-            "rust",
-            Some("deepseek"),
-            Some("off"),
-            Some("old-launch"),
-        ));
-        assert!(!gateway_health_matches(
-            &old,
-            "rust",
-            Some("deepseek"),
-            Some("off"),
-            Some(""),
-        ));
-    }
-
-    #[test]
-    fn health_reader_waits_for_declared_body() {
-        let partial = b"HTTP/1.1 200 OK\r\ncontent-length: 17\r\n\r\n{\"gateway\":\"r";
-        assert_eq!(
-            expected_http_response_len(partial),
-            Some("HTTP/1.1 200 OK\r\ncontent-length: 17\r\n\r\n".len() + 17)
-        );
-        let complete = b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n";
-        assert_eq!(expected_http_response_len(complete), Some(complete.len()));
-    }
-
-    #[test]
     fn get_body_none_when_nothing_listening() {
         // 没人监听 → 连不上 → None（与 http_health 一致的失败关闭语义）。
         assert!(http_get_body(59998, Some("secret"), "/v1/models", 300).is_none());
+    }
+
+    #[test]
+    fn which_finds_sh() {
+        let sh = which("sh");
+        assert!(sh.is_some(), "PATH 里应能找到 sh");
+        assert!(sh.unwrap().is_absolute());
+    }
+
+    #[test]
+    fn which_absent_returns_none() {
+        assert!(which("definitely-not-a-real-binary-xyzzy").is_none());
+    }
+
+    #[test]
+    fn find_in_dirs_locates_exec() {
+        // /bin/sh 几乎肯定存在且可执行。
+        let hit = find_in_dirs("sh", vec![PathBuf::from("/usr/bin"), PathBuf::from("/bin")]);
+        assert!(hit.is_some(), "应在 /usr/bin 或 /bin 里找到 sh");
+        assert!(is_exec(&hit.unwrap()));
+    }
+
+    #[test]
+    fn find_in_dirs_none_when_absent() {
+        assert!(find_in_dirs("definitely-not-xyzzy", vec![PathBuf::from("/bin")]).is_none());
+    }
+
+    #[test]
+    fn login_shell_resolves_sh_when_zsh_present() {
+        // 环境无 zsh 则跳过（CI 容器可能没有）。
+        if which("zsh").is_none() {
+            return;
+        }
+        let p = which_via_login_shell("sh");
+        assert!(p.is_some(), "登录 shell 应能解析 sh");
+        let p = p.unwrap();
+        assert!(p.is_absolute() && is_exec(&p));
+    }
+
+    #[test]
+    fn login_shell_rejects_bad_names_without_spawning() {
+        // 白名单：带 shell 元字符的名字直接拒（防注入），空名亦拒。
+        assert!(which_via_login_shell("node; rm -rf /").is_none());
+        assert!(which_via_login_shell("$(whoami)").is_none());
+        assert!(which_via_login_shell("").is_none());
+    }
+
+    #[test]
+    fn find_exe_finds_sh() {
+        assert!(find_exe("sh").is_some());
+    }
+
+    #[test]
+    fn common_bin_dirs_covers_expected_paths() {
+        let dirs = common_bin_dirs();
+        if cfg!(target_os = "macos") {
+            // macOS：Homebrew 两个前缀 + MacPorts 必在。
+            assert!(dirs
+                .iter()
+                .any(|d| d == &PathBuf::from("/opt/homebrew/bin")));
+            assert!(dirs.iter().any(|d| d == &PathBuf::from("/usr/local/bin")));
+            assert!(dirs.iter().any(|d| d == &PathBuf::from("/opt/local/bin")));
+        } else {
+            // Linux：/usr/local/bin 必在。
+            assert!(dirs
+                .iter()
+                .any(|d| d == &PathBuf::from("/usr/local/bin")));
+        }
+        // HOME 存在时应含版本管理器目录（volta）与 ~/.local/bin。
+        if std::env::var_os("HOME").is_some() {
+            assert!(
+                dirs.iter()
+                    .any(|d| d.to_string_lossy().contains(".volta/bin")),
+                "HOME 下应含 .volta/bin 兜底目录"
+            );
+            assert!(
+                dirs.iter()
+                    .any(|d| d.to_string_lossy().contains(".local/bin")),
+                "HOME 下应含 .local/bin 兜底目录"
+            );
+        }
     }
 
     #[test]

@@ -1,10 +1,10 @@
 {
   "name": "desktop",
   "private": true,
-  "version": "0.4.4",
+  "version": "1.2.0",
   "type": "module",
   "scripts": {
-    "tauri": "bash ../scripts/clean-bundle-resources.sh && tauri"
+    "tauri": "tauri"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2"

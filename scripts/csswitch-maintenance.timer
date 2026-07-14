@@ -1,0 +1,9 @@
+[Unit]
+Description=CSSwitch daily maintenance timer (09:00 / 21:00 Asia/Shanghai)
+
+[Timer]
+OnCalendar=09:00,21:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

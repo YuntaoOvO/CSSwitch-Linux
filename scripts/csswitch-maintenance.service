@@ -1,0 +1,8 @@
+[Unit]
+Description=CSSwitch daily maintenance inspection
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash %h/CSSwitch/scripts/daily-maintenance.sh
+StandardOutput=append:%h/CSSwitch/findings/auto-maint/logs/systemd.out.log
+StandardError=append:%h/CSSwitch/findings/auto-maint/logs/systemd.err.log

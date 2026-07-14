@@ -5,12 +5,12 @@ members = [
     "crates/csswitch-templates",
     "crates/csswitch-oauth",
     "crates/csswitch-runtime",
-    "desktop/gateway",
     "cli",
+    "desktop/gateway",
 ]
 
 [workspace.package]
-version = "1.1.1"
+version = "1.2.0"
 edition = "2021"
 license = "MIT"
 authors = ["CSSwitch"]
