@@ -1,0 +1,22 @@
+[package]
+name = "csswitch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "CSSwitch CLI – provider switcher and launcher for Claude Science on Linux"
+
+[[bin]]
+name = "csswitch"
+path = "src/main.rs"
+
+[dependencies]
+csswitch-runtime = { path = "../crates/csswitch-runtime" }
+csswitch-config = { path = "../crates/csswitch-config" }
+csswitch-templates = { path = "../crates/csswitch-templates" }
+csswitch-oauth = { path = "../crates/csswitch-oauth" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "6"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "native-tls"] }
+libc = "0.2"

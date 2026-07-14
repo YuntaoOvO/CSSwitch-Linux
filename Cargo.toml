@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/csswitch-config",
+    "crates/csswitch-templates",
+    "crates/csswitch-oauth",
+    "crates/csswitch-runtime",
+    "desktop/gateway",
+    "cli",
+]
+
+[workspace.package]
+version = "0.5.0"
+edition = "2021"
+license = "MIT"
+authors = ["CSSwitch"]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
