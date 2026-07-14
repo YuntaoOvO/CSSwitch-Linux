@@ -4,7 +4,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License">
-  <img src="https://img.shields.io/badge/release-v0.5.0-2ea44f.svg" alt="CSSwitch Linux v0.5.0">
+  <img src="https://img.shields.io/badge/release-v1.1.0-2ea44f.svg" alt="CSSwitch Linux v1.1.0">
   <img src="https://img.shields.io/badge/platform-Linux%20|%20WSL%20|%20headless-1d1d1f.svg" alt="Linux">
   <img src="https://img.shields.io/badge/built%20with-Rust-dca282.svg" alt="Rust">
 </p>
@@ -22,7 +22,7 @@ CSSwitch Linux 是基于 [CSSwitch v0.4.4](https://github.com/SuperJJ007/CSSwitc
 
 ## 与 macOS 桌面版的区别
 
-|                              | macOS 桌面版 (v0.4.4)   | Linux CLI 版 (v0.5.0)       |
+|                              | macOS 桌面版 (v0.4.4)   | Linux CLI 版 (v1.1.0)       |
 | ---------------------------- | ------------------------ | ----------------------------- |
 | **界面**                     | Tauri 2 菜单栏面板       | 纯 CLI（手写参数解析）        |
 | **平台**                     | macOS Apple Silicon      | Linux / WSL / headless         |
@@ -44,8 +44,8 @@ CSSwitch Linux 是基于 [CSSwitch v0.4.4](https://github.com/SuperJJ007/CSSwitc
 **方式一：deb 包（Debian / Ubuntu）**
 
 ```bash
-curl -LO https://github.com/YuntaoOvO/CSSwitch-Linux/releases/latest/download/csswitch_0.5.0_amd64.deb
-sudo dpkg -i csswitch_0.5.0_amd64.deb
+curl -LO https://github.com/YuntaoOvO/CSSwitch-Linux/releases/latest/download/csswitch_1.1.0_amd64.deb
+sudo dpkg -i csswitch_1.1.0_amd64.deb
 ```
 
 **方式二：从源码编译**
@@ -153,7 +153,7 @@ cargo build --release -p csswitch -p csswitch-gateway
 cargo test --workspace
 
 # 打包
-make deb          # 生成 releases/csswitch_0.5.0_amd64.deb
+make deb          # 生成 releases/csswitch_1.1.0_amd64.deb
 make install      # 安装到 /usr/local/bin
 ```
 

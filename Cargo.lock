@@ -149,7 +149,7 @@ dependencies = [
 
 [[package]]
 name = "csswitch"
-version = "0.5.0"
+version = "1.1.0"
 dependencies = [
  "csswitch-config",
  "csswitch-oauth",
@@ -164,7 +164,7 @@ dependencies = [
 
 [[package]]
 name = "csswitch-config"
-version = "0.5.0"
+version = "1.1.0"
 dependencies = [
  "csswitch-templates",
  "serde",
@@ -183,7 +183,7 @@ dependencies = [
 
 [[package]]
 name = "csswitch-oauth"
-version = "0.5.0"
+version = "1.1.0"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -195,7 +195,7 @@ dependencies = [
 
 [[package]]
 name = "csswitch-runtime"
-version = "0.5.0"
+version = "1.1.0"
 dependencies = [
  "csswitch-config",
  "csswitch-templates",
@@ -207,7 +207,7 @@ dependencies = [
 
 [[package]]
 name = "csswitch-templates"
-version = "0.5.0"
+version = "1.1.0"
 
 [[package]]
 name = "ctr"

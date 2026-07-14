@@ -1,7 +1,7 @@
 .PHONY: all build clean install deb rpm
 
 PREFIX ?= /usr/local
-VERSION := 0.5.0
+VERSION := 1.1.0
 
 all: build
 
