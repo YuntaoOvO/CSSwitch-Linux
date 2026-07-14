@@ -141,7 +141,7 @@ fn has_flag(flags: &[(String, Option<String>)], name: &str) -> bool {
 }
 
 fn print_usage() {
-    println!(r#"CSSwitch CLI v0.5.0 – provider switcher for Claude Science
+    println!(r#"CSSwitch CLI v1.1.1 – provider switcher for Claude Science
 
 USAGE:
   csswitch <command> [subcommand] [flags] [args]

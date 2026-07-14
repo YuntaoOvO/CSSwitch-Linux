@@ -7,8 +7,8 @@ A pure CLI port of [CSSwitch v0.4.4](https://github.com/SuperJJ007/CSSwitch) for
 **Via deb (Debian/Ubuntu):**
 
 ```bash
-curl -LO https://github.com/YuntaoOvO/CSSwitch-Linux/releases/latest/download/csswitch_1.1.0_amd64.deb
-sudo dpkg -i csswitch_1.1.0_amd64.deb
+curl -LO https://github.com/YuntaoOvO/CSSwitch-Linux/releases/latest/download/csswitch_1.1.1_amd64.deb
+sudo dpkg -i csswitch_1.1.1_amd64.deb
 ```
 
 **From source:**

@@ -114,7 +114,11 @@ pub fn start_gateway(
 }
 
 /// Perform HTTP health check against the proxy using raw TCP (no reqwest dependency).
-pub fn proxy_health(port: u16, _secret: &str) -> bool {
+///
+/// The gateway requires requests to include the auth secret as a path prefix
+/// (e.g. `GET /<secret>/health`) when `--auth-token` is set. Without the prefix,
+/// the gateway returns 403 and the health check would never pass.
+pub fn proxy_health(port: u16, secret: &str) -> bool {
     use std::io::{Read, Write};
     use std::net::TcpStream;
 
@@ -129,12 +133,19 @@ pub fn proxy_health(port: u16, _secret: &str) -> bool {
     let _ = stream.set_read_timeout(Some(Duration::from_millis(2000)));
     let _ = stream.set_write_timeout(Some(Duration::from_millis(2000)));
 
-    let req = "GET /health HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n";
+    // Gateway router strips the /{secret} prefix before matching the path.
+    // When auth_token is non-empty, ALL requests must carry the prefix.
+    let req = if secret.is_empty() {
+        "GET /health HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n".to_string()
+    } else {
+        format!("GET /{secret}/health HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+    };
+
     if stream.write_all(req.as_bytes()).is_err() {
         return false;
     }
 
-    let mut buf = [0u8; 128];
+    let mut buf = [0u8; 512];
     let n = stream.read(&mut buf).unwrap_or(0);
     let response = String::from_utf8_lossy(&buf[..n]);
     response.contains("200") || response.contains("OK")
